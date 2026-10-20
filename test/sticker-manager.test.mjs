@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import sharp from 'sharp';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-sticker-manager-'));
 process.env.QQ_AGENT_DATA_DIR = root;
@@ -55,7 +56,9 @@ test('manual uploaded stickers can be viewed and sent by agent tools', async (t)
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const manager = new StickerManager({ call: async () => [] });
   const sticker = manager.addManual({
-    imageBuffer: Buffer.from('89504e470d0a1a0a00000000', 'hex'),
+    imageBuffer: await sharp({
+      create: { width: 32, height: 32, channels: 3, background: '#ffcc00' }
+    }).png().toBuffer(),
     desc: '本地测试'
   });
   const sent = [];
@@ -80,10 +83,12 @@ test('manual uploaded stickers can be viewed and sent by agent tools', async (t)
   const viewResult = await view.execute(context, { stickerId: sticker.id });
   assert.equal(viewResult.isError, undefined);
   assert.equal(viewResult.content[1].type, 'image_url');
-  assert.match(viewResult.content[1].image_url.url, /^data:image\/png;base64,/);
+  assert.match(viewResult.content[1].image_url.url, /^data:image\/jpeg;base64,/);
 
   const webp = manager.addManual({
-    imageBuffer: Buffer.from('524946460400000057454250', 'hex'),
+    imageBuffer: await sharp({
+      create: { width: 32, height: 32, channels: 3, background: '#00aaff' }
+    }).webp().toBuffer(),
     desc: 'WebP 测试'
   });
   const webpSendResult = await send.execute(context, { stickerId: webp.id });
@@ -91,7 +96,7 @@ test('manual uploaded stickers can be viewed and sent by agent tools', async (t)
   assert.match(sent[1].url, /^base64:\/\//);
   const webpViewResult = await view.execute(context, { stickerId: webp.id });
   assert.equal(webpViewResult.isError, undefined);
-  assert.match(webpViewResult.content[1].image_url.url, /^data:image\/webp;base64,/);
+  assert.match(webpViewResult.content[1].image_url.url, /^data:image\/jpeg;base64,/);
 });
 
 test('refuses to overwrite a corrupted sticker metadata file', (t) => {

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import sharp from 'sharp';
 
 const { buildToolDefs, executeTool } = await import('../src/tools.js');
 
@@ -89,7 +90,9 @@ test('send tools accept a verified current group member', async () => {
 });
 
 test('get_message_images refreshes an expired stored URL from the source message', async () => {
-  const png = Buffer.from('89504e470d0a1a0a00000000', 'hex').toString('base64');
+  const png = (await sharp({
+    create: { width: 8, height: 8, channels: 3, background: '#ffffff' }
+  }).png().toBuffer()).toString('base64');
   const updates = [];
   const entry = {
     mid: '77',
@@ -112,7 +115,7 @@ test('get_message_images refreshes an expired stored URL from the source message
   const result = await tool('get_message_images').execute(f.ctx, { messageId: '77' });
   assert.equal(result.isError, undefined);
   assert.equal(result.content[1].type, 'image_url');
-  assert.match(result.content[1].image_url.url, /^data:image\/png;base64,/);
+  assert.match(result.content[1].image_url.url, /^data:image\/jpeg;base64,/);
   assert.equal(updates.length, 1);
   assert.equal(updates[0][2].appendMedia[0].url, `base64://${png}`);
 });

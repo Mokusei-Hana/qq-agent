@@ -9,32 +9,28 @@ import { formatStickerList } from './stickers.js';
 import { validateImageUrl, safeFetchBinary } from './safe-fetch.js';
 import { webSearch, webFetch } from './web-search.js';
 import { expandForwardNodes, extractMediaFromSegments } from './onebot.js';
+import { prepareImageDataUrls } from './image-prep.js';
 
-async function downloadImageAsDataUrl(url, signal) {
+const MAX_IMAGES_PER_VIEW = 12;
+
+async function downloadImageBuffer(url, signal) {
   signal?.throwIfAborted();
   if (String(url || '').startsWith('base64://')) {
     const buffer = Buffer.from(String(url).slice('base64://'.length), 'base64');
     if (!buffer.length || buffer.length > 12 * 1024 * 1024) {
       throw new Error('本地表情图片为空或超过 12 MiB');
     }
-    const mime = detectMime(buffer);
-    if (!mime) throw new Error('本地表情图片格式无效');
-    return `data:${mime};base64,${buffer.toString('base64')}`;
+    return buffer;
   }
   const safeUrl = await validateImageUrl(url);
-  const { buffer, contentType } = await safeFetchBinary(safeUrl, 12 * 1024 * 1024, signal);
+  const { buffer } = await safeFetchBinary(safeUrl, 12 * 1024 * 1024, signal);
   if (!buffer || !buffer.length) throw new Error('图片内容为空');
-  const mime = detectMime(buffer) || String(contentType || 'image/jpeg').split(';')[0];
-  return `data:${mime};base64,${buffer.toString('base64')}`;
+  return buffer;
 }
 
-function detectMime(buf) {
-  if (!buf || buf.length < 12) return null;
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png';
-  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
-  if (buf.toString('ascii', 0, 6) === 'GIF87a' || buf.toString('ascii', 0, 6) === 'GIF89a') return 'image/gif';
-  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
-  return null;
+async function downloadImageAsDataUrls(url, signal, options = {}) {
+  const buffer = await downloadImageBuffer(url, signal);
+  return prepareImageDataUrls(buffer, options);
 }
 
 function ok(payload) {
@@ -323,8 +319,8 @@ export function buildToolDefs() {
           const sticker = await ctx.stickers.findForSend(args.stickerId);
           if (!sticker) return err(`找不到表情 ${args.stickerId}`);
           if (!sticker.url) return err('该表情没有图片地址');
-          const dataUrl = await downloadImageAsDataUrl(sticker.url, ctx.signal);
-          return { content: imageParts(`表情 ${sticker.id}（备注：${sticker.desc || '无'}）：`, [dataUrl]) };
+          const prepared = await downloadImageAsDataUrls(sticker.url, ctx.signal, { split: false });
+          return { content: imageParts(`表情 ${sticker.id}（备注：${sticker.desc || '无'}）：`, prepared.dataUrls.slice(0, 1)) };
         } catch (error) {
           return err(error?.message ?? error);
         }
@@ -527,13 +523,33 @@ export function buildToolDefs() {
           if (!urls.length) return ok(`消息 ${args.messageId} 没有可查看的图片`);
           const dataUrls = [];
           const failed = [];
-          for (const url of urls) {
+          const notes = [];
+          let omitted = 0;
+          for (let index = 0; index < urls.length; index += 1) {
             ctx.signal?.throwIfAborted();
-            try { dataUrls.push(await downloadImageAsDataUrl(url, ctx.signal)); } catch (e) { failed.push(String(e?.message ?? e)); }
+            try {
+              const prepared = await downloadImageAsDataUrls(urls[index], ctx.signal, { split: true });
+              notes.push(`图${index + 1}：${prepared.note}`);
+              for (const dataUrl of prepared.dataUrls) {
+                if (dataUrls.length >= MAX_IMAGES_PER_VIEW) {
+                  omitted += 1;
+                  continue;
+                }
+                dataUrls.push(dataUrl);
+              }
+            } catch (e) {
+              failed.push(String(e?.message ?? e));
+            }
           }
           if (!dataUrls.length) return err(`图片获取失败：${failed.join('；')}`);
-          const note = failed.length ? `（另有 ${failed.length} 张获取失败）` : '';
-          return { content: imageParts(`消息 ${args.messageId} 的图片内容${note}：`, dataUrls) };
+          const lines = [`消息 ${args.messageId} 的图片内容：`];
+          if (notes.some((line) => line.includes('切成'))) {
+            lines.push('长截图已分段，图片按下面的顺序发送；同一张长图按从上到下的顺序排列。');
+          }
+          lines.push(...notes);
+          if (failed.length) lines.push(`另有 ${failed.length} 张获取失败：${failed.join('；')}`);
+          if (omitted) lines.push(`图片过多，已省略 ${omitted} 张（含分段）。`);
+          return { content: imageParts(lines.join('\n'), dataUrls) };
         } catch (error) {
           return err(error?.message ?? error);
         }
