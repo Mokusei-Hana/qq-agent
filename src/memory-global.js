@@ -9,6 +9,25 @@ const chatDir = (chatKey) => path.join(MEMORY_DIR, chatDirName(chatKey));
 const metaFile = (chatKey) => path.join(chatDir(chatKey), '_meta.json');
 const handoffFile = (chatKey) => path.join(chatDir(chatKey), '_handoff.json');
 const clean = (v, n = 1000) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, n);
+const RETRY_MAX_MEMBERS = 20;
+function normalizeRetryMembers(value) {
+  const out = [];
+  const seen = new Set();
+  for (const item of Array.isArray(value) ? value : []) {
+    const userId = String(item?.userId || '').trim();
+    if (!/^\d{1,15}$/.test(userId) || seen.has(userId)) continue;
+    seen.add(userId);
+    out.push({
+      userId,
+      name: clean(item?.name, 60),
+      reason: clean(item?.reason, 120),
+      attempts: Math.max(1, Number(item?.attempts) || 1),
+      lastAttemptedAt: Number(item?.lastAttemptedAt) || 0
+    });
+    if (out.length >= RETRY_MAX_MEMBERS) break;
+  }
+  return out;
+}
 function list(value, maxItems = 8, maxChars = 240) {
   const out = []; const seen = new Set();
   for (const item of Array.isArray(value) ? value : []) {
@@ -138,45 +157,62 @@ export class MemoryStore {
   consolidationState(chatKey) {
     const members = this.people.members(chatKey); const meta = readJson(metaFile(chatKey), {}) || {};
     return {
-      lastConsolidatedAt: Math.max(Number(meta.lastConsolidatedAt) || 0, ...members.map((m) => m.lastConsolidatedAt || 0)),
+      // 群级成功时间只来自 _meta.json；成员个人时间单独维护，
+      // 避免"部分成功"被成员时间抬成群级成功而阻塞失败重试。
+      lastConsolidatedAt: Number(meta.lastConsolidatedAt) || 0,
       lastAttemptedAt: Number(meta.lastAttemptedAt) || 0,
       lastResult: clean(meta.lastResult, 40),
       lastError: clean(meta.lastError, 300),
       consecutiveFailures: Math.max(0, Number(meta.consecutiveFailures) || 0),
+      retryMembers: normalizeRetryMembers(meta.retryMembers),
       counts: { memberImpression: members.reduce((n, m) => n + m.impressions.length, 0) },
       members: members.map((m) => ({ userId: m.userId, name: m.name || m.userId, count: m.impressions.length, lastConsolidatedAt: m.lastConsolidatedAt || 0 }))
     };
   }
   /**
    * 记录一次整理尝试（尝试时间与结果），与成功整理时间分开保存。
-   * running / no_targets / failed 都走这里，避免把"试过"误当成"成功"。
+   * running / no_targets / failed / partial_failed 都走这里，避免把"试过"误当成"成功"。
+   * retryMembers 为待自动重试的失败成员；不传则保留旧队列。
    */
-  markConsolidationAttempt(chatKey, { at = Date.now(), result = '', error = '' } = {}) {
+  markConsolidationAttempt(chatKey, { at = Date.now(), result = '', error = '', retryMembers = undefined } = {}) {
     const when = Number(at) || Date.now();
     fs.mkdirSync(chatDir(chatKey), { recursive: true });
     const prev = readJson(metaFile(chatKey), {}) || {};
     const outcome = clean(result, 40) || 'unknown';
+    const failed = outcome === 'failed' || outcome === 'partial_failed';
     writeJson(metaFile(chatKey), {
       ...prev,
       lastAttemptedAt: when,
       lastResult: outcome,
       lastError: clean(error, 300),
-      consecutiveFailures: Math.max(0, Number(prev.consecutiveFailures) || 0) + (outcome === 'failed' ? 1 : 0)
+      retryMembers: retryMembers === undefined
+        ? normalizeRetryMembers(prev.retryMembers)
+        : normalizeRetryMembers(retryMembers),
+      consecutiveFailures: Math.max(0, Number(prev.consecutiveFailures) || 0) + (failed ? 1 : 0)
     });
   }
-  markConsolidated(chatKey, at = Date.now(), userIds = [], { result = 'success', error = '' } = {}) {
+  /** 只更新成功成员的个人整理时间，不推进整群成功状态。 */
+  markMembersConsolidated(userIds, at = Date.now()) {
+    this.people.markConsolidated(userIds, Number(at) || Date.now());
+  }
+  markConsolidated(chatKey, at = Date.now(), userIds = [], { result = 'success', error = '', retryMembers = [] } = {}) {
     const when = Number(at) || Date.now(); fs.mkdirSync(chatDir(chatKey), { recursive: true });
     const prev = readJson(metaFile(chatKey), {}) || {};
     const outcome = clean(result, 40) || 'success';
+    // 先更新成功成员的个人时间，再写群级成功时间：
+    // 成员写入失败时不留下“群已成功”的误导状态。
+    this.people.markConsolidated(userIds, when);
     writeJson(metaFile(chatKey), {
       ...prev,
       lastConsolidatedAt: when,
       lastAttemptedAt: Math.max(Number(prev.lastAttemptedAt) || 0, when),
       lastResult: outcome,
       lastError: clean(error, 300),
-      consecutiveFailures: Math.max(0, Number(prev.consecutiveFailures) || 0) + (outcome === 'success' ? 0 : 1)
+      retryMembers: normalizeRetryMembers(retryMembers),
+      consecutiveFailures: outcome === 'success'
+        ? 0
+        : Math.max(0, Number(prev.consecutiveFailures) || 0) + 1
     });
-    this.people.markConsolidated(userIds, when);
   }
   replaceConsolidated(chatKey, next) {
     const groups = new Map();

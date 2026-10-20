@@ -46,7 +46,10 @@ test('people memory page guides the first consolidation and separates empty/load
   assert.match(people, /id="gm-goto-session"/);
   assert.match(people, /这个人目前没有长期印象/);
   assert.match(people, /正在整理人物记忆/);
-  assert.match(people, /整理失败：/);
+  assert.match(people, /waitForConsolidationOutcome/);
+  assert.match(people, /partial_failed/);
+  assert.match(people, /gm-status-warning/);
+  assert.match(people, /整理失败/);
   assert.match(people, /loadState === 'error'/);
   assert.match(people, /人物记忆加载失败/);
   assert.match(people, /人物记忆详情读取失败/);

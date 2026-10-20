@@ -73,7 +73,7 @@ function fixture(t, { consolidateEnabled = true } = {}) {
     globalThis.fetch = originalFetch;
   });
 
-  const append = (chatKey, senderId, count, { name = '群友', ts = Date.now() } = {}) => {
+  const append = (chatKey, senderId, count, { name = '群友', ts = Date.now(), eventKind = 'message' } = {}) => {
     let last = null;
     for (let i = 0; i < count; i += 1) {
       last = store.appendIncoming(chatKey, {
@@ -81,13 +81,19 @@ function fixture(t, { consolidateEnabled = true } = {}) {
         text: `第 ${i + 1} 条消息`,
         senderId: String(senderId),
         senderName: name,
-        ts: ts + i
+        ts: ts + i,
+        eventKind
       });
     }
     return last;
   };
+  const appendSelf = (chatKey, count = 1) => {
+    for (let i = 0; i < count; i += 1) {
+      store.appendSelf(chatKey, { mid: `${chatKey}-self-${Date.now()}-${i}`, text: '机器人回复' });
+    }
+  };
 
-  return { cfg, runner, store, memory, append };
+  return { cfg, runner, store, memory, append, appendSelf };
 }
 
 function mockModel(reply) {
@@ -97,6 +103,24 @@ function mockModel(reply) {
     if (typeof reply === 'function') return reply(calls.length);
     return Response.json({
       choices: [{ message: { content: reply } }],
+      usage: { total_tokens: 12 }
+    });
+  };
+  return calls;
+}
+
+function mockModelByUser(behaviors) {
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(String(init?.body || '{}'));
+    const prompt = (body.messages || []).map((m) => String(m.content || '')).join('\n');
+    const uid = /群友（QQ (\d+)/.exec(prompt)?.[1] || /群友 QQ：(\d+)/.exec(prompt)?.[1] || '';
+    calls.push(uid);
+    const behavior = behaviors[uid];
+    if (behavior instanceof Error) throw behavior;
+    if (typeof behavior === 'function') return behavior();
+    return Response.json({
+      choices: [{ message: { content: behavior ?? '{}' } }],
       usage: { total_tokens: 12 }
     });
   };
@@ -231,15 +255,15 @@ test('unparsable model output is recorded as a failure', async (t) => {
   assert.equal(memory.consolidationState('group:107').lastResult, 'failed');
 });
 
-test('identity validation failure does not call the model or mark success', async (t) => {
+test('unreliable identity is not treated as a consolidation target', async (t) => {
   const { runner, memory, append } = fixture(t);
   append('group:108', 'not-a-qq', 20, { name: '无名' });
   const calls = mockModel(NEW_IMPRESSION);
 
   const result = await runner.startMemoryConsolidation('group:108', { userIds: ['not-a-qq'], force: true });
-  assert.equal(result.ok, false);
-  assert.match(result.failed[0].reason, /身份校验失败/);
-  assert.equal(calls.length, 0, '身份校验失败不应调用模型');
+  assert.equal(result.status, 'no_targets');
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 0, '不可靠身份不应调用模型');
   assert.equal(memory.consolidationState('group:108').lastConsolidatedAt, 0);
 });
 
@@ -271,7 +295,8 @@ test('failed consolidation backs off instead of retrying on every message', asyn
   assert.equal(calls.length, 1);
 
   const later = runner.memoryConsolidationPlan('group:110', { now: Date.now() + 31 * MINUTE });
-  assert.equal(later?.reason, 'cold-start', '退避结束后才允许重试');
+  assert.equal(later?.reason, 'retry-failed-members', '退避结束后重试失败成员，而不是重新冷启动');
+  assert.deepEqual(later?.retryUserIds, ['5010']);
   assert.equal(memory.consolidationState('group:110').lastConsolidatedAt, 0);
 });
 
@@ -317,4 +342,244 @@ test('the task lock is released even when consolidation throws early', async (t)
 
   await assert.rejects(runner.startMemoryConsolidation('group:112', { coldStart: true }), /模型未配置/);
   assert.equal(runner.consolidating.has('group:112'), false);
+});
+
+test('malformed impressions fields never erase or replace existing memories', async (t) => {
+  const { runner, memory, append } = fixture(t);
+  append('group:120', '6120', 10, { name: '甲' });
+  memory.append('group:120', 'memberImpression', '原有印象：喜欢猫', { userId: '6120', target: '甲' });
+
+  for (const payload of ['{}', '{"impressions":null}', '{"impressions":"text"}', '{"impressions":[{"x":1}]}', '{"impressions":["   "]}']) {
+    mockModel(payload);
+    const result = await runner.startMemoryConsolidation('group:120', { userIds: ['6120'], force: true });
+    assert.equal(result.status, 'failed', `payload ${payload} 必须失败`);
+    assert.equal(result.ok, false);
+    assert.deepEqual(
+      memory.getMember('group:120', '6120').impressions.map((item) => item.content),
+      ['原有印象：喜欢猫'],
+      `payload ${payload} 不得清空原印象`
+    );
+    assert.equal(memory.consolidationState('group:120').lastConsolidatedAt, 0, '格式错误不得更新成功时间');
+  }
+});
+
+test('explicit empty impressions array is allowed for existing members only', async (t) => {
+  const { runner, memory, append } = fixture(t);
+  append('group:121', '6121', 10, { name: '乙' });
+  memory.append('group:121', 'memberImpression', '可以被删除的印象', { userId: '6121', target: '乙' });
+
+  mockModel('{"impressions":[]}');
+  const result = await runner.startMemoryConsolidation('group:121', { userIds: ['6121'], force: true });
+  assert.equal(result.status, 'success');
+  assert.equal(memory.getMember('group:121', '6121').impressions.length, 0);
+  assert.ok(memory.consolidationState('group:121').lastConsolidatedAt > 0);
+
+  // 新建人物仍然不允许空数组：没有稳定特征就应失败，而不是创建空记忆。
+  append('group:1211', '6122', 20, { name: '丙' });
+  mockModel('{"impressions":[]}');
+  const created = await runner.startMemoryConsolidation('group:1211', { coldStart: true });
+  assert.equal(created.status, 'failed');
+  assert.equal(memory.members('group:1211').length, 0);
+  assert.equal(memory.consolidationState('group:1211').lastConsolidatedAt, 0);
+});
+
+test('valid non-empty impressions array still updates the member', async (t) => {
+  const { runner, memory, append } = fixture(t);
+  append('group:1212', '6123', 10, { name: '丁' });
+  memory.append('group:1212', 'memberImpression', '旧印象', { userId: '6123', target: '丁' });
+
+  mockModel('{"impressions":["更新后的稳定印象"]}');
+  const result = await runner.startMemoryConsolidation('group:1212', { userIds: ['6123'], force: true });
+  assert.equal(result.status, 'success');
+  assert.deepEqual(
+    memory.getMember('group:1212', '6123').impressions.map((item) => item.content),
+    ['更新后的稳定印象']
+  );
+});
+
+test('partial success keeps failed members in a persisted retry queue', async (t) => {
+  const { runner, memory, append } = fixture(t);
+  append('group:122', '6201', 20, { name: '甲' });
+  append('group:122', '6202', 15, { name: '乙' });
+  append('group:122', '6203', 10, { name: '丙' });
+
+  const calls = mockModelByUser({
+    '6201': JSON.stringify({ impressions: ['甲说话直接'] }),
+    '6202': '这不是 JSON',
+    '6203': new Error('model down')
+  });
+  const result = await runner.startMemoryConsolidation('group:122', { coldStart: true });
+
+  assert.equal(result.status, 'partial_failed');
+  assert.equal(result.ok, false);
+  assert.equal(result.retryCount, 2);
+  assert.equal(calls.length, 3);
+
+  assert.deepEqual(memory.members('group:122').map((m) => m.userId), ['6201']);
+  assert.ok(memory.getMember('group:122', '6201').lastConsolidatedAt > 0, '成功成员应更新个人整理时间');
+  assert.equal(memory.getMember('group:122', '6202').lastConsolidatedAt, 0);
+
+  const state = memory.consolidationState('group:122');
+  assert.equal(state.lastResult, 'partial_failed');
+  assert.equal(state.lastConsolidatedAt, 0, '部分成功不得推进整群成功时间');
+  assert.deepEqual(state.retryMembers.map((m) => m.userId), ['6202', '6203']);
+
+  // 退避期内不重试；退避结束后只重试失败成员，不重复整理 6201。
+  assert.equal(runner.memoryConsolidationPlan('group:122'), null);
+  const plan = runner.memoryConsolidationPlan('group:122', { now: Date.now() + 31 * MINUTE });
+  assert.equal(plan?.reason, 'retry-failed-members');
+  assert.deepEqual(plan?.retryUserIds, ['6202', '6203']);
+  assert.equal(plan.retryUserIds.includes('6201'), false);
+
+  const retryCalls = mockModelByUser({
+    '6202': JSON.stringify({ impressions: ['乙喜欢猫'] }),
+    '6203': JSON.stringify({ impressions: ['丙常发图'] })
+  });
+  const retried = await runner.startMemoryConsolidation('group:122', { retryUserIds: plan.retryUserIds });
+  assert.equal(retried.status, 'success');
+  assert.deepEqual(retryCalls, ['6202', '6203'], '重试只处理失败成员，不重复调用已成功的 6201');
+  assert.deepEqual(new Set(memory.members('group:122').map((m) => m.userId)), new Set(['6201', '6202', '6203']));
+  assert.equal(memory.consolidationState('group:122').retryMembers.length, 0);
+  assert.ok(memory.consolidationState('group:122').lastConsolidatedAt > 0);
+  assert.equal(memory.consolidationState('group:122').consecutiveFailures, 0, '成功重试后应清零失败计数');
+});
+
+test('failed retry queue survives a process restart', async (t) => {
+  const { runner, append, store } = fixture(t);
+  append('group:123', '6301', 20, { name: '甲' });
+  mockModel('这不是 JSON');
+  await runner.startMemoryConsolidation('group:123', { coldStart: true });
+
+  // 新的 MemoryStore + 新 Orchestrator 模拟进程重启，确认状态来自磁盘而不是内存。
+  const reloadedMemory = new MemoryStore();
+  const restarted = new Orchestrator({
+    store,
+    memory: reloadedMemory,
+    sessions: new SessionRegistry(),
+    stickers: {},
+    sender: { sendTextBatch: async () => ({ sent: [], failed: [] }) },
+    onebot: { selfId: '999', selfNickname: 'bot', getGroupInfo: async () => ({ group_name: 'test' }) }
+  });
+  t.after(async () => { await restarted.abortAll(); });
+
+  const plan = restarted.memoryConsolidationPlan('group:123', { now: Date.now() + 31 * MINUTE });
+  assert.equal(plan?.reason, 'retry-failed-members');
+  assert.deepEqual(plan?.retryUserIds, ['6301']);
+  assert.equal(reloadedMemory.consolidationState('group:123').lastConsolidatedAt, 0);
+});
+
+test('all-failed consolidation has a distinct failed status and retry queue', async (t) => {
+  const { runner, memory, append } = fixture(t);
+  append('group:124', '6401', 20, { name: '甲' });
+  mockModel('这不是 JSON');
+  const result = await runner.startMemoryConsolidation('group:124', { coldStart: true });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.ok, false);
+  assert.equal(result.retryCount, 1);
+  const state = memory.consolidationState('group:124');
+  assert.equal(state.lastResult, 'failed');
+  assert.equal(state.lastConsolidatedAt, 0);
+  assert.deepEqual(state.retryMembers.map((m) => m.userId), ['6401']);
+});
+
+test('cold start message threshold ignores bot messages and non-chat events', async (t) => {
+  const { runner, store, append, appendSelf } = fixture(t);
+  append('group:130', '6130', 19, { name: '甲' });
+  append('group:130', '6130', 5, { name: '甲', eventKind: 'poke' });
+  appendSelf('group:130', 10);
+
+  const meta = store.getChatMeta('group:130');
+  assert.equal(meta.total, 34);
+  assert.equal(meta.incomingCount, 19, '只统计真人普通聊天消息');
+  assert.equal(runner.memoryConsolidationPlan('group:130'), null);
+
+  append('group:130', '6130', 1, { name: '甲' });
+  assert.equal(store.getChatMeta('group:130').incomingCount, 20);
+  assert.equal(runner.memoryConsolidationPlan('group:130')?.reason, 'cold-start');
+
+  append('group:1302', '6131', 20, { name: '乙', eventKind: 'poke' });
+  appendSelf('group:1302', 5);
+  assert.equal(store.lastIncomingTs('group:1302'), 0, '只有拍一拍和机器人消息时不算真人聊天');
+  assert.equal(runner.memoryConsolidationPlan('group:1302'), null);
+});
+
+test('discovery ignores pokes and anonymous sender ids', async (t) => {
+  const { runner, memory, append } = fixture(t);
+  append('group:132', '6141', 20, { name: '正常群友' });
+  append('group:132', '6142', 5, { name: '拍一拍', eventKind: 'poke' });
+  append('group:132', '80000000', 8, { name: '匿名' });
+  append('group:132', '0', 4, { name: '匿名 0' });
+
+  const calls = mockModelByUser({ '6141': NEW_IMPRESSION });
+  const result = await runner.startMemoryConsolidation('group:132', { coldStart: true });
+  assert.equal(result.status, 'success');
+  assert.deepEqual(calls, ['6141']);
+  assert.deepEqual(memory.members('group:132').map((m) => m.userId), ['6141']);
+});
+
+test('zero-impression private manual consolidation keeps the original discovery floor', async (t) => {
+  const { runner, memory, append } = fixture(t);
+  append('private:1', '6150', 5, { name: '私聊对象' });
+  const privateCalls = mockModel(NEW_IMPRESSION);
+  const privateResult = await runner.startMemoryConsolidation('private:1', { force: true });
+  assert.equal(privateResult.status, 'no_targets');
+  assert.equal(privateCalls.length, 0);
+  assert.equal(memory.members('private:1').length, 0);
+
+  append('group:133', '6151', 5, { name: '群友' });
+  const groupCalls = mockModel(NEW_IMPRESSION);
+  const groupResult = await runner.startMemoryConsolidation('group:133', { force: true });
+  assert.equal(groupResult.status, 'success');
+  assert.equal(groupCalls.length, 1);
+});
+
+test('a recent failed retry is not blocked by an older successful cooldown', async (t) => {
+  const { runner, memory, append } = fixture(t);
+  append('group:125', '6501', 10, { name: '甲' });
+  memory.append('group:125', 'memberImpression', '旧印象', { userId: '6501', target: '甲' });
+  // 模拟两小时前成功整理过；随后手动整理失败，不能被 6 小时成功冷却压住。
+  memory.markConsolidated('group:125', Date.now() - 2 * 60 * 60 * 1000, []);
+  mockModel('这不是 JSON');
+  const result = await runner.startMemoryConsolidation('group:125', { userIds: ['6501'], force: true });
+  assert.equal(result.status, 'failed');
+  assert.equal(memory.consolidationState('group:125').retryMembers.length, 1);
+
+  assert.equal(runner.memoryConsolidationPlan('group:125'), null, '失败退避期内仍不得重试');
+  const plan = runner.memoryConsolidationPlan('group:125', { now: Date.now() + 31 * MINUTE });
+  assert.equal(plan?.reason, 'retry-failed-members');
+  assert.deepEqual(plan?.retryUserIds, ['6501']);
+});
+
+test('a failure is persisted before the batch finishes (crash-safe retry queue)', async (t) => {
+  const { runner, memory, append } = fixture(t);
+  append('group:126', '6601', 20, { name: '甲' });
+  append('group:126', '6602', 10, { name: '乙' });
+
+  let releaseSecond = null;
+  mockModelByUser({
+    '6601': '这不是 JSON',
+    '6602': () => new Promise((resolve) => {
+      releaseSecond = () => resolve(Response.json({
+        choices: [{ message: { content: JSON.stringify({ impressions: ['乙喜欢猫'] }) } }],
+        usage: { total_tokens: 12 }
+      }));
+    })
+  });
+
+  const task = runner.startMemoryConsolidation('group:126', { coldStart: true });
+  const startedAt = Date.now();
+  while (!releaseSecond) {
+    if (Date.now() - startedAt > 5000) throw new Error('等待第二个成员模型调用超时');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  // 第一个成员已失败、第二个还在调用模型：此时队列必须已经落盘。
+  const during = memory.consolidationState('group:126');
+  assert.equal(during.lastResult, 'running');
+  assert.deepEqual(during.retryMembers.map((m) => m.userId), ['6601']);
+
+  releaseSecond();
+  const result = await task;
+  assert.equal(result.status, 'partial_failed');
+  assert.equal(memory.consolidationState('group:126').lastResult, 'partial_failed');
 });

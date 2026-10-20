@@ -1613,8 +1613,22 @@ export class Orchestrator {
     const minInterval = Math.max(30 * 60 * 1000,
       Number(cfg.memory?.consolidateMinIntervalMs) || 6 * 60 * 60 * 1000);
     // 成功整理后的冷却与失败/空目标的重试退避分开计算，避免把"尝试过"当成"成功过"。
-    if (now - (Number(st.lastConsolidatedAt) || 0) < minInterval) return null;
     if (now - (Number(st.lastAttemptedAt) || 0) < this.#consolidationRetryDelay(st, cfg, minInterval)) return null;
+
+    // 失败成员的重试优先于阈值、冷启动和旧的整群成功冷却：
+    // 它不依赖"当前群还没有印象"，也不会重复整理已经成功的人。
+    const retryMembers = Array.isArray(st.retryMembers) ? st.retryMembers.filter((m) => m?.userId) : [];
+    if (retryMembers.length) {
+      return {
+        reason: 'retry-failed-members',
+        coldStart: false,
+        retryUserIds: retryMembers.map((m) => String(m.userId)),
+        state: st
+      };
+    }
+
+    // 没有待重试成员时，原有成功冷却继续生效。
+    if (now - (Number(st.lastConsolidatedAt) || 0) < minInterval) return null;
 
     // 阈值可配置：config.memory.consolidateMinImpressions（默认取类常量）
     const minImpressions = Math.max(1,
@@ -1639,7 +1653,8 @@ export class Orchestrator {
     if (!String(chatKey).startsWith('group:')) return null;
     if (impressionCount > 0) return null;
     const meta = typeof this.store?.getChatMeta === 'function' ? this.store.getChatMeta(chatKey) : null;
-    const messageCount = Number(meta?.total) || 0;
+    // 冷启动只看真实聊天消息：排除机器人回复、拍一拍和系统事件。
+    const messageCount = Number(meta?.incomingCount ?? meta?.total) || 0;
     if (messageCount < Orchestrator.COLD_START_MIN_MESSAGES) return null;
     // 必须来自真实存储：优先取最近一条真人消息，回退到会话最后一条消息时间。
     const lastIncomingAt = typeof this.store?.lastIncomingTs === 'function'
@@ -1676,6 +1691,9 @@ export class Orchestrator {
       lastAttemptedAt: local.at,
       lastResult: local.result,
       lastError: local.error || '',
+      retryMembers: Array.isArray(local.retryMembers)
+        ? local.retryMembers
+        : (st.retryMembers || []),
       consecutiveFailures: Math.max(
         Number(st.consecutiveFailures) || 0,
         Number(local.consecutiveFailures) || 0
@@ -1699,7 +1717,11 @@ export class Orchestrator {
     try {
       const plan = this.memoryConsolidationPlan(chatKey);
       if (!plan) return;
-      const task = this.startMemoryConsolidation(chatKey, { coldStart: plan.coldStart, reason: plan.reason });
+      const task = this.startMemoryConsolidation(chatKey, {
+        coldStart: plan.coldStart,
+        reason: plan.reason,
+        retryUserIds: plan.retryUserIds || null
+      });
       task?.catch((error) => console.error(`[memory] 整理 ${chatKey} 失败:`, error?.message ?? error));
     } catch { /* 整理是锦上添花，绝不影响聊天主流程 */ }
   }
@@ -1727,15 +1749,20 @@ export class Orchestrator {
     });
   }
 
-  async #consolidateMemoryForChat(chatKey, { userIds = null, force = false, coldStart = false } = {}) {
+  async #consolidateMemoryForChat(chatKey, { userIds = null, force = false, coldStart = false, retryUserIds = null } = {}) {
     const cfg = getConfig();
     if (!cfg.api?.model || !cfg.api?.baseUrl) throw new Error('模型未配置，无法整理记忆');
+    const priorState = this.#consolidationStatus(chatKey);
+    const priorRetry = Array.isArray(priorState.retryMembers) ? priorState.retryMembers : [];
     // 先记下"尝试"再干活：即使进程中途崩溃，重启后也会按退避等待，
     // 不会把遗留状态当成仍在运行的任务。
     this.#markConsolidationAttempt(chatKey, { result: 'running' });
     const notes = cfg.memberNotes || {};
     const only = Array.isArray(userIds) && userIds.length
       ? new Set(userIds.map((u) => String(u ?? '').trim()).filter(Boolean))
+      : null;
+    const retryOnly = Array.isArray(retryUserIds) && retryUserIds.length
+      ? new Set(retryUserIds.map((u) => String(u ?? '').trim()).filter((u) => /^\d{1,15}$/.test(u)))
       : null;
 
     const stats = this.#scanChatActivity(chatKey);
@@ -1769,6 +1796,37 @@ export class Orchestrator {
           isNew: true
         });
       }
+    } else if (retryOnly) {
+      // 只重试上一轮明确失败的成员；每次都重新校验身份、发言和现有印象，
+      // 不复用旧的候选人资格，也不重复处理已经成功的人。
+      for (const uid of retryOnly) {
+        const found = existing.find((m) => String(m.userId || '') === uid);
+        if (found) {
+          const resolved = this.#resolveIdentity(chatKey, found, stats, notes);
+          if (this.#shouldSkip(resolved, false)) {
+            skipped.push({ userId: resolved.userId, name: resolved.name, reason: this.#skipReason(resolved) });
+            continue;
+          }
+          targets.push({ ...resolved, isNew: false, retrying: true });
+          continue;
+        }
+        const msgCount = stats.memberMsgCount.get(uid) || 0;
+        if (msgCount < Orchestrator.MEMBER_MIN_MESSAGES) {
+          skipped.push({
+            userId: uid,
+            name: stats.uidToName.get(uid) || notes[uid] || '',
+            reason: '聊天记录出现不足 3 条，暂不重试'
+          });
+          continue;
+        }
+        targets.push({
+          userId: uid,
+          name: stats.uidToName.get(uid) || notes[uid] || `QQ ${uid}`,
+          impressions: [],
+          isNew: true,
+          retrying: true
+        });
+      }
     } else {
       // 先整理记忆里已有的人
       const knownUserIds = new Set();
@@ -1794,7 +1852,8 @@ export class Orchestrator {
       // 冷启动/首次整理时放宽到与单成员整理门槛一致：
       // 否则一个 20 多人各说两句的新群，永远凑不出"单人发言 20 条"，
       // 整理入口打开了也依旧没有目标。
-      const effectiveDiscoverMin = noImpressionsYet
+      // 仅对群聊生效；零印象私聊的手动整理保留原有发现门槛。
+      const effectiveDiscoverMin = noImpressionsYet && String(chatKey).startsWith('group:')
         ? Math.min(discoverMin, Orchestrator.MEMBER_MIN_MESSAGES)
         : discoverMin;
       const discoverMax = Math.max(1,
@@ -1821,13 +1880,18 @@ export class Orchestrator {
     if (!targets.length) {
       // 没有任何目标时不调模型，但必须留下"尝试过"的痕迹，
       // 否则每条新消息都会重新触发一次同样没有结果的整理。
+      // 重试轮里被重新校验淘汰的成员要从队列移除；普通整理则保留旧队列。
+      const retryMembers = this.#nextRetryMembers(priorRetry, retryOnly, [], [], Date.now());
       this.#markConsolidationAttempt(chatKey, {
         result: 'no_targets',
-        error: skipped.length ? `跳过 ${skipped.length} 位` : ''
+        error: skipped.length ? `跳过 ${skipped.length} 位` : '',
+        retryMembers
       });
       return {
         ok: true,
+        status: 'no_targets',
         reason: 'no_targets',
+        retryCount: retryMembers.length,
         note: `没有可整理的群友${skippedNote || (only ? '（未指定有效群友）' : '（该群还没有任何群友印象，且聊天记录里没有发言足够多的活跃成员）')}`,
         changed: 0,
         results: [],
@@ -1847,7 +1911,11 @@ export class Orchestrator {
       const before = mem.impressions.map((e) => e.content);
       try {
         const next = await this.#consolidateOneMember(chatKey, mem, { force, stats });
-        if (!next) { failed.push({ userId: mem.userId, name: mem.name, reason: '模型没有返回可写入的印象' }); continue; }
+        if (!next) {
+          failed.push({ userId: mem.userId, name: mem.name, reason: '模型没有返回可写入的印象' });
+          this.#persistRetryProgress(chatKey, priorRetry, retryOnly, results, failed);
+          continue;
+        }
         const after = next.impressions.map((e) => e.content);
         const isChanged = after.length !== before.length || after.some((c, i) => c !== before[i]);
         if (isChanged) changed += 1;
@@ -1861,38 +1929,115 @@ export class Orchestrator {
         });
       } catch (error) {
         failed.push({ userId: mem.userId, name: mem.name, reason: String(error?.message ?? error) });
+        this.#persistRetryProgress(chatKey, priorRetry, retryOnly, results, failed);
       }
     }
 
-    const discoveredCount = targets.filter((t) => t.isNew).length;
+    const discoveredCount = targets.filter((t) => t.isNew && !t.retrying).length;
     const note = this.#buildConsolidateNote({
       total: targets.length, changed, failed, skipped, only, discoveredCount
     });
-    // 只有真正写入成功才更新成功时间；全部失败/中途中断只记尝试与原因。
-    const failureSummary = failed.slice(0, 3)
+    // 中途中断时，没跑到的目标也算待重试，不能被静默丢掉。
+    const handledIds = new Set([
+      ...results.map((r) => String(r.userId || '')),
+      ...failed.map((f) => String(f.userId || ''))
+    ]);
+    const pendingFailures = this.aborted
+      ? targets
+        .filter((t) => !handledIds.has(String(t.userId || '')))
+        .map((t) => ({ userId: t.userId, name: t.name, reason: '整理被中断' }))
+      : [];
+    const allFailures = [...failed, ...pendingFailures];
+    const at = Date.now();
+    const retryMembers = this.#nextRetryMembers(priorRetry, retryOnly, results, allFailures, at);
+    const successIds = results.map((r) => r.userId).filter(Boolean);
+
+    let status;
+    if (!results.length) status = 'failed';
+    else if (allFailures.length || retryMembers.length) status = 'partial_failed';
+    else status = 'success';
+
+    const failureSummary = allFailures.slice(0, 3)
       .map((f) => `${f.name || f.userId}：${f.reason}`)
       .join('；');
-    if (results.length) {
-      this.#markConsolidated(chatKey, targets.map((t) => t.userId).filter(Boolean), {
-        result: failed.length ? 'partial' : 'success',
-        error: failureSummary
+    if (status === 'success') {
+      // 只有全部候选都实际持久化成功，才推进整群成功时间并清空重试队列。
+      this.#markConsolidated(chatKey, successIds, { result: 'success' });
+    } else if (status === 'partial_failed') {
+      // 成功的人只更新个人时间；整群成功时间保持不变，失败的人进入持久化重试队列。
+      this.#markMembersConsolidated(successIds, at);
+      this.#markConsolidationAttempt(chatKey, {
+        at,
+        result: 'partial_failed',
+        error: failureSummary,
+        retryMembers
       });
     } else {
       this.#markConsolidationAttempt(chatKey, {
+        at,
         result: 'failed',
-        error: failureSummary || (this.aborted ? '整理被中断' : '没有写入任何印象')
+        error: failureSummary || (this.aborted ? '整理被中断' : '没有写入任何印象'),
+        retryMembers
       });
     }
     return {
-      ok: results.length > 0,
-      reason: results.length ? undefined : 'failed',
+      ok: status === 'success',
+      status,
+      reason: status === 'success' ? undefined : status,
+      retryCount: retryMembers.length,
       coldStart: !!coldStart,
       note,
       changed,
       results,
       skipped,
-      failed
+      failed: allFailures
     };
+  }
+
+  /**
+   * 计算下一次自动重试的成员队列（最多 20 人）：
+   * - 成功的成员移出队列；
+   * - 本轮失败/中断的成员累加尝试次数；
+   * - 重试轮里重新校验不合格的成员也移出队列。
+   */
+  #nextRetryMembers(priorRetry, retryOnly, results, failed, at = Date.now()) {
+    const map = new Map();
+    for (const item of Array.isArray(priorRetry) ? priorRetry : []) {
+      const userId = String(item?.userId || '').trim();
+      if (/^\d{1,15}$/.test(userId)) map.set(userId, { ...item, userId });
+    }
+    const succeeded = new Set(results.map((r) => String(r.userId || '').trim()).filter(Boolean));
+    for (const userId of succeeded) map.delete(userId);
+    for (const failure of failed) {
+      const userId = String(failure?.userId || '').trim();
+      if (!/^\d{1,15}$/.test(userId)) continue;
+      const prev = map.get(userId);
+      map.set(userId, {
+        userId,
+        name: String(failure.name || prev?.name || '').slice(0, 60),
+        reason: String(failure.reason || prev?.reason || '').slice(0, 120),
+        attempts: Math.max(1, Number(prev?.attempts) || 0) + (prev ? 1 : 0),
+        lastAttemptedAt: at
+      });
+    }
+    if (retryOnly) {
+      const handled = new Set([...succeeded, ...failed.map((f) => String(f.userId || ''))]);
+      for (const userId of retryOnly) if (!handled.has(userId)) map.delete(userId);
+    }
+    return [...map.values()].slice(0, 20);
+  }
+
+  /**
+   * 单个成员失败后立即把重试队列写入 _meta.json。
+   * 即使进程在批次中途崩溃，重启后也能按退避重试这些失败成员。
+   */
+  #persistRetryProgress(chatKey, priorRetry, retryOnly, results, failed) {
+    const retryMembers = this.#nextRetryMembers(priorRetry, retryOnly, results, failed, Date.now());
+    this.#markConsolidationAttempt(chatKey, {
+      result: 'running',
+      error: failed[failed.length - 1]?.reason || '',
+      retryMembers
+    });
   }
 
   /** 统计会话里各成员的出现次数与名字（用于身份识别与"新建印象"）。 */
@@ -1902,8 +2047,11 @@ export class Orchestrator {
     const nameToUserId = new Map();
     const uidToName = new Map();
     for (const m of this.store.recent(chatKey, { limit: 2000 })) {
+      // 只统计真实聊天消息：排除机器人、拍一拍/系统事件、匿名与占位 ID。
       if (m.self || !m.senderId) continue;
-      const uid = String(m.senderId);
+      if (m.eventKind && m.eventKind !== 'message') continue;
+      const uid = String(m.senderId).trim();
+      if (!/^\d{1,15}$/.test(uid) || UNRELIABLE_SENDER_IDS.has(uid)) continue;
       memberMsgCount.set(uid, (memberMsgCount.get(uid) || 0) + 1);
       const nm = String(m.senderName || '').trim();
       // 跳过占位名（历史脏数据：拍一拍事件曾把 senderName 写成"（拍一拍事件）"）
@@ -1980,6 +2128,7 @@ export class Orchestrator {
       at: now,
       result,
       error: details.error || '',
+      retryMembers: [],
       consecutiveFailures: result === 'success' ? 0 : 1
     });
     try {
@@ -1989,25 +2138,38 @@ export class Orchestrator {
     }
   }
 
+  /** 只更新成功成员的个人整理时间，不推进整群成功状态。 */
+  #markMembersConsolidated(userIds, at = Date.now()) {
+    try {
+      if (typeof this.memory?.markMembersConsolidated === 'function') {
+        this.memory.markMembersConsolidated(userIds, at);
+      }
+    } catch (error) {
+      console.warn('[memory] 记录成员整理时间失败:', error?.message ?? error);
+    }
+  }
+
   /**
-   * 记录一次整理尝试（running / no_targets / failed）。
+   * 记录一次整理尝试（running / no_targets / failed / partial_failed）。
    * 持久化到 _meta.json；同时写一份内存兜底，保证元数据写失败时也不会每条消息重试。
    */
-  #markConsolidationAttempt(chatKey, { at = Date.now(), result = '', error = '' } = {}) {
+  #markConsolidationAttempt(chatKey, { at = Date.now(), result = '', error = '', retryMembers = undefined } = {}) {
     const when = Number(at) || Date.now();
     const outcome = String(result || 'unknown');
     const previous = this.consolidationAttempts.get(chatKey);
+    const failed = outcome === 'failed' || outcome === 'partial_failed';
     this.consolidationAttempts.set(chatKey, {
       at: when,
       result: outcome,
       error: error || '',
-      consecutiveFailures: outcome === 'failed'
+      retryMembers: Array.isArray(retryMembers) ? retryMembers : previous?.retryMembers,
+      consecutiveFailures: failed
         ? Math.max(0, Number(previous?.consecutiveFailures) || 0) + 1
         : Math.max(0, Number(previous?.consecutiveFailures) || 0)
     });
     try {
       if (typeof this.memory?.markConsolidationAttempt === 'function') {
-        this.memory.markConsolidationAttempt(chatKey, { at: when, result: outcome, error });
+        this.memory.markConsolidationAttempt(chatKey, { at: when, result: outcome, error, retryMembers });
       }
     } catch (error) {
       console.warn('[memory] 记录整理尝试失败:', error?.message ?? error);
@@ -2043,15 +2205,25 @@ export class Orchestrator {
     assertTimeAllowed();
 
     const parsed = extractJsonObject(String(res?.message?.content ?? ''));
-    if (!parsed) {
-      console.warn(`[memory] ${isNew ? '新建' : '整理'} ${chatKey}/${mem.userId || mem.name} 结果无法解析为 JSON，本轮放弃`);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      console.warn(`[memory] ${isNew ? '新建' : '整理'} ${chatKey}/${mem.userId || mem.name} 结果无法解析为 JSON 对象，本轮放弃`);
       if (process.env.QQ_AGENT_DEBUG_MEMORY) {
         console.warn('[memory][debug] 原始返回 =', JSON.stringify(String(res?.message?.content ?? '')).slice(0, 1500));
       }
       return null;
     }
+    // 严格校验：字段缺失/为 null/类型错误都不能降级成空数组，
+    // 否则一次格式异常就会清空已有长期印象。
+    if (!Array.isArray(parsed.impressions)) {
+      console.warn(`[memory] ${isNew ? '新建' : '整理'} ${chatKey}/${mem.userId || mem.name} 缺少 impressions 数组，本轮放弃`);
+      return null;
+    }
+    if (parsed.impressions.some((item) => typeof item !== 'string')) {
+      console.warn(`[memory] ${isNew ? '新建' : '整理'} ${chatKey}/${mem.userId || mem.name} impressions 元素类型错误，本轮放弃`);
+      return null;
+    }
 
-    const raw = Array.isArray(parsed.impressions) ? parsed.impressions : [];
+    const raw = parsed.impressions;
     const maxKeep = Number(getConfig().memory?.maxImpressionsPerMember) || 5;
 
     // 整理模式：条数变多 = 疑似幻觉，放弃（保留原印象）
@@ -2065,6 +2237,12 @@ export class Orchestrator {
       .filter(Boolean)
       .slice(0, maxKeep)
       .map((content) => content.slice(0, 120));
+
+    // 非空数组却没有任何有效文本：视为格式/内容异常，不能当成“删除全部印象”。
+    if (raw.length && !clean.length) {
+      console.warn(`[memory] ${isNew ? '新建' : '整理'} ${chatKey}/${userId} impressions 没有有效文本，本轮放弃`);
+      return null;
+    }
 
     // 新建模式却没提炼出任何稳定特征：不写入空印象，也不当成成功。
     if (isNew && !clean.length) {
@@ -2100,7 +2278,7 @@ export class Orchestrator {
     const maxKeep = Number(getConfig().memory?.maxImpressionsPerMember) || 5;
     const uid = String(mem.userId || '');
     const sample = (this.store.recent(chatKey, { limit: 2000 }) || [])
-      .filter((m) => !m.self && String(m.senderId) === uid)
+      .filter((m) => !m.self && (!m.eventKind || m.eventKind === 'message') && String(m.senderId) === uid)
       .slice(-40)
       .map((m) => String(m.text || '').slice(0, 200))
       .filter(Boolean);
@@ -2260,6 +2438,13 @@ const PLACEHOLDER_NAMES = new Set([
   '(拍一拍事件)',
   '未知',
   '某人'
+]);
+
+// 不可靠的发送者 ID：QQ 匿名消息和系统占位账号。
+// 这些 ID 会被多个匿名发言者共用，不能当作同一个可长期记忆的人物。
+const UNRELIABLE_SENDER_IDS = new Set([
+  '0',
+  '80000000'
 ]);
 
 /**

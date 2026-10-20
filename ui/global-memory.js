@@ -65,6 +65,7 @@
       .gm-error { opacity:1; color:#e05a5a; }
       .gm-status { font-size:12px; opacity:.75; }
       .gm-status-error { color:#e05a5a; opacity:1; }
+      .gm-status-warning { color:#d49b2f; opacity:1; }
       .gm-status-running { color:var(--accent-color, #4f9cf9); opacity:1; }
     `;
     document.head.appendChild(style);
@@ -172,6 +173,7 @@
 
   function statusClass(kind) {
     if (kind === 'error') return 'gm-status gm-status-error';
+    if (kind === 'warning') return 'gm-status gm-status-warning';
     if (kind === 'consolidating') return 'gm-status gm-status-running';
     return 'gm-status';
   }
@@ -233,6 +235,57 @@
       method: 'POST',
       body: JSON.stringify({ chatKey, userIds: [userId], force: true })
     });
+  }
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function readConsolidationStatus(chatKey) {
+    const summary = await api('/api/memory-files');
+    const file = (Array.isArray(summary.files) ? summary.files : [])
+      .find((item) => item.chatKey === chatKey);
+    if (!file) return null;
+    return {
+      consolidating: file.consolidating === true,
+      status: String(file.consolidation?.status || ''),
+      retryCount: Math.max(0, Number(file.consolidation?.retryCount) || 0)
+    };
+  }
+
+  /**
+   * 轮询后端整理状态，直到任务结束或达到上限。
+   * 只读取状态字段，不把内部异常或聊天内容带进页面。
+   */
+  async function waitForConsolidationOutcome(chatKey, { attempts = 90, intervalMs = 2500 } = {}) {
+    let failures = 0;
+    for (let i = 0; i < attempts; i += 1) {
+      await sleep(intervalMs + (failures ? Math.min(30000, failures * 2000) : 0));
+      let state;
+      try {
+        state = await readConsolidationStatus(chatKey);
+        failures = 0;
+      } catch {
+        failures += 1;
+        continue;
+      }
+      if (!state) return { status: 'unknown', text: '整理状态暂时不可用，请稍后刷新查看' };
+      if (state.consolidating) continue;
+      if (state.status === 'success') return { status: 'success', text: '整理完成' };
+      if (state.status === 'partial_failed') {
+        return {
+          status: 'partial_failed',
+          text: `部分完成：${state.retryCount} 位成员失败，稍后会自动重试`
+        };
+      }
+      if (state.status === 'failed') {
+        return { status: 'failed', text: '整理失败，已保留原印象，稍后会自动重试' };
+      }
+      if (state.status === 'no_targets') return { status: 'no_targets', text: '没有可整理的群友' };
+      if (state.status === 'running') {
+        return { status: 'failed', text: '上次整理未正常结束，稍后会自动重试' };
+      }
+      return { status: state.status || 'unknown', text: '整理已结束，但未能确认结果，请刷新查看' };
+    }
+    return { status: 'timeout', text: '整理仍在进行或结果未知，请稍后刷新查看' };
   }
 
   async function deletePerson(person) {
@@ -312,17 +365,17 @@
       button.disabled = true;
       setAction('consolidating', '正在整理人物记忆…');
       try {
+        const chatKey = sourceFor(person);
         await consolidatePerson(person);
-        setAction('consolidating', '整理中，完成后会自动刷新');
-        setTimeout(() => loadGlobalMemory(true), 2500);
-        setTimeout(() => {
-          if (actionState.key === person.key && actionState.kind === 'consolidating') {
-            setAction('done', '已刷新；若印象没有变化，说明模型认为无需调整');
-          }
-          loadGlobalMemory(true);
-        }, 7000);
+        setAction('consolidating', '整理中，正在等待结果…');
+        const outcome = await waitForConsolidationOutcome(chatKey);
+        if (outcome.status === 'failed') setAction('error', outcome.text);
+        else if (outcome.status === 'partial_failed' || outcome.status === 'timeout' || outcome.status === 'unknown') {
+          setAction('warning', outcome.text);
+        } else setAction('done', outcome.text);
+        await loadGlobalMemory(true);
       } catch (error) {
-        setAction('error', `整理失败：${error?.message || error}`);
+        setAction('error', `整理请求失败：${error?.message || error}`);
         button.disabled = false;
       }
     });

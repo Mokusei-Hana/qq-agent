@@ -216,6 +216,7 @@ export class ChatStore {
 
   getChatMeta(chatKey) {
     const counts = this.db.prepare(`SELECT COUNT(*) AS total,
+      COALESCE(SUM(self=0 AND event_kind='message'),0) AS incomingCount,
       COALESCE(SUM(state IN ('pending','leased')),0) AS unread,
       COALESCE(SUM(state='failed'),0) AS failed,
       COALESCE(SUM(state='held'),0) AS heldMessages FROM messages WHERE chat_key=?`).get(chatKey);
@@ -250,9 +251,10 @@ export class ChatStore {
       AND state='pending' AND available_at<=?`).get(chatKey, Date.now()).n;
   }
 
-  /** 最近一条"真人"消息的时间；用于记忆冷启动判断近期是否真的有新消息。 */
+  /** 最近一条真人聊天消息的时间；排除机器人消息和拍一拍等非普通事件。 */
   lastIncomingTs(chatKey) {
-    const row = this.db.prepare('SELECT MAX(ts) AS ts FROM messages WHERE chat_key=? AND self=0').get(chatKey);
+    const row = this.db.prepare(`SELECT MAX(ts) AS ts FROM messages
+      WHERE chat_key=? AND self=0 AND event_kind='message'`).get(chatKey);
     return Number(row?.ts) || 0;
   }
 

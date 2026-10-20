@@ -77,6 +77,61 @@ function decodeImageDataUrl(value) {
   return buffer;
 }
 
+/**
+ * 把整理异常转换成可以安全发给前端的简短原因。
+ * 不返回原始 message，避免模型 HTTP 响应、路径或密钥片段进入控制台。
+ */
+export function safeConsolidationError(error) {
+  const text = String(error?.message ?? error ?? '');
+  if (/模型未配置/.test(text)) return '模型未配置，无法整理记忆';
+  if (/非活跃时间|TIME_CONTROL_INACTIVE/.test(text)) return '当前不在允许调用模型的时间段';
+  if (/超时|timeout|timed out/i.test(text)) return '模型请求超时，请稍后重试';
+  if (/模型 API HTTP|模型请求失败/.test(text)) return '模型服务暂时不可用，请稍后重试';
+  return '整理过程中发生错误，请稍后重试';
+}
+
+/**
+ * 手动整理完成后的前端事件语义。只暴露状态、数量和提示，
+ * 不把原始 failed 原因、异常堆栈或聊天内容发给浏览器。
+ */
+export function buildConsolidationUpdate(result) {
+  const status = String(result?.status || (result?.ok === false ? 'failed' : 'success'));
+  const updated = Array.isArray(result?.results) ? result.results.length : 0;
+  const failedCount = Array.isArray(result?.failed) ? result.failed.length : 0;
+  const retryCount = Math.max(0, Number(result?.retryCount) || 0);
+  if (status === 'failed') {
+    const failedText = failedCount ? `${failedCount} 位未完成` : '未完成';
+    return {
+      phase: 'consolidate-error',
+      status,
+      ok: false,
+      error: `整理失败：${failedText}，已保留原印象${retryCount ? '；稍后会自动重试' : ''}`
+    };
+  }
+  if (status === 'partial_failed') {
+    return {
+      phase: 'consolidate-done',
+      status,
+      ok: false,
+      note: `部分完成：${updated} 位已更新，${failedCount} 位失败${retryCount ? '；失败的成员会按退避自动重试' : ''}`
+    };
+  }
+  if (status === 'no_targets') {
+    return { phase: 'consolidate-done', status, ok: true, note: String(result?.note || '没有可整理的群友') };
+  }
+  return {
+    phase: 'consolidate-done',
+    status: 'success',
+    ok: true,
+    note: String(result?.note || '整理完成')
+  };
+}
+
+/** 统一的 memory-update 事件发送入口，便于路由与测试复用同一套语义。 */
+export function emitConsolidationResult(emit, chatKey, result) {
+  emit('memory-update', { chatKey, ...buildConsolidationUpdate(result) });
+}
+
 export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
   const cfg = getConfig();
   const bus = createEventBus();
@@ -2470,6 +2525,15 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
 
       // 记忆文件列表（记忆页签）：白名单里的每个群都显示，含无记忆的
       if (pathname === '/api/memory-files' && method === 'GET') {
+        const consolidationView = (chatKey) => {
+          const state = memory.consolidationState(chatKey);
+          return {
+            status: state.lastResult || '',
+            retryCount: Array.isArray(state.retryMembers) ? state.retryMembers.length : 0,
+            lastAttemptedAt: Number(state.lastAttemptedAt) || 0,
+            lastConsolidatedAt: Number(state.lastConsolidatedAt) || 0
+          };
+        };
         const files = memory.listChats().map((chatKey) => {
           const members = memory.members(chatKey);
           const handoff = memory.getHandoff(chatKey);
@@ -2480,6 +2544,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
             memberCount: members.length,
             hasHandoff: Boolean(handoff),
             handoffExpiresAt: handoff?.expiresAt || 0,
+            consolidation: consolidationView(chatKey),
             updatedAt: Math.max(
               Number(handoff?.updatedAt) || 0,
               0,
@@ -2495,7 +2560,8 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
           if (!seen.has(key)) {
             files.push({
               chatKey: key, impressionCount: 0, memberCount: 0,
-              hasHandoff: false, handoffExpiresAt: 0, updatedAt: 0, consolidating: false
+              hasHandoff: false, handoffExpiresAt: 0, updatedAt: 0, consolidating: false,
+              consolidation: { status: '', retryCount: 0, lastAttemptedAt: 0, lastConsolidatedAt: 0 }
             });
           }
         }
@@ -2504,7 +2570,8 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
           if (!seen.has(key)) {
             files.push({
               chatKey: key, impressionCount: 0, memberCount: 0,
-              hasHandoff: false, handoffExpiresAt: 0, updatedAt: 0, consolidating: false
+              hasHandoff: false, handoffExpiresAt: 0, updatedAt: 0, consolidating: false,
+              consolidation: { status: '', retryCount: 0, lastAttemptedAt: 0, lastConsolidatedAt: 0 }
             });
           }
         }
@@ -2593,11 +2660,15 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
           if (!task) return json(res, 409, { ok: false, error: '该群已在整理中' });
           emit('memory-update', { chatKey, phase: 'consolidate-start', userIds });
           task
-            .then((result) => {
-              emit('memory-update', { chatKey, phase: 'consolidate-done', ...(result || {}) });
-            })
+            .then((result) => emitConsolidationResult(emit, chatKey, result))
             .catch((error) => {
-              emit('memory-update', { chatKey, phase: 'consolidate-error', error: String(error?.message ?? error) });
+              emit('memory-update', {
+                chatKey,
+                phase: 'consolidate-error',
+                status: 'failed',
+                ok: false,
+                error: safeConsolidationError(error)
+              });
             });
           return json(res, 202, { ok: true, started: true });
         } catch (error) {
