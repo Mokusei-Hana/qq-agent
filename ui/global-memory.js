@@ -5,6 +5,9 @@
   let people = [];
   let selectedKey = '';
   let loadSeq = 0;
+  let loadState = 'idle';       // idle | loading | ready | error
+  let loadError = '';
+  let actionState = { key: '', kind: '', text: '' }; // kind: consolidating | done | error
 
   const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -57,7 +60,12 @@
       .gm-section h3 { margin:0 0 8px; }
       .gm-note { padding:10px 12px; margin:0 0 12px; border-radius:8px; background:rgba(127,127,127,.08); font-size:13px; line-height:1.5; }
       .gm-empty { padding:24px 14px; opacity:.6; }
+      .gm-empty-guide { opacity:1; line-height:1.65; }
+      .gm-empty-guide .gm-guide-text { max-width:520px; }
+      .gm-error { opacity:1; color:#e05a5a; }
       .gm-status { font-size:12px; opacity:.75; }
+      .gm-status-error { color:#e05a5a; opacity:1; }
+      .gm-status-running { color:var(--accent-color, #4f9cf9); opacity:1; }
     `;
     document.head.appendChild(style);
   }
@@ -134,6 +142,10 @@
       if (!/^(group|private)_\d+$/.test(path)) return null;
       return api(`/api/memory-files/${path}`);
     });
+    // 有来源却一条都没读到 = 后端/接口故障，不能当成“没有人物记忆”。
+    if (sourceFiles.length > 0 && details.every((detail) => !detail)) {
+      throw new Error('人物记忆详情读取失败');
+    }
 
     const map = new Map();
     for (const detail of details) {
@@ -149,11 +161,41 @@
       .sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0));
   }
 
+  const EMPTY_GUIDE = '还没有人物长期记忆。请前往会话记忆页，选择群聊并执行一次“整理本群记忆”。';
+
+  function goToSessionMemory() {
+    // 按页签文字定位，避免人物记忆页直接依赖会话记忆页的内部 data-tab 标记。
+    const tab = [...document.querySelectorAll('.tab')]
+      .find((item) => item.textContent.trim() === '会话记忆');
+    if (tab) tab.click();
+  }
+
+  function statusClass(kind) {
+    if (kind === 'error') return 'gm-status gm-status-error';
+    if (kind === 'consolidating') return 'gm-status gm-status-running';
+    return 'gm-status';
+  }
+
   function renderList() {
     const box = document.getElementById('global-memory-items');
     if (!box) return;
+    if (loadState === 'error') {
+      box.innerHTML = `<div class="gm-empty gm-error">人物记忆加载失败：${esc(loadError || '未知错误')}
+        <div class="gm-toolbar"><button type="button" class="btn btn-small" id="gm-list-retry">重试</button></div>
+      </div>`;
+      box.querySelector('#gm-list-retry')?.addEventListener('click', () => loadGlobalMemory(true));
+      return;
+    }
+    if (loadState === 'loading' && !people.length) {
+      box.innerHTML = '<div class="gm-empty">正在读取人物记忆…</div>';
+      return;
+    }
     if (!people.length) {
-      box.innerHTML = '<div class="gm-empty">还没有人物长期记忆</div>';
+      box.innerHTML = `<div class="gm-empty gm-empty-guide">
+        <div class="gm-guide-text">${EMPTY_GUIDE}</div>
+        <div class="gm-toolbar"><button type="button" class="btn btn-small" id="gm-goto-session">前往会话记忆页</button></div>
+      </div>`;
+      box.querySelector('#gm-goto-session')?.addEventListener('click', goToSessionMemory);
       return;
     }
     box.innerHTML = people.map((person) => {
@@ -211,7 +253,13 @@
     if (!box) return;
     const person = people.find((item) => item.key === selectedKey);
     if (!person) {
-      box.innerHTML = '<div class="empty-hint">← 选择人物查看全局长期记忆</div>';
+      if (loadState === 'error') {
+        box.innerHTML = `<div class="empty-hint gm-error">人物记忆加载失败：${esc(loadError || '未知错误')}</div>`;
+      } else if (!people.length && loadState !== 'loading') {
+        box.innerHTML = `<div class="empty-hint">${EMPTY_GUIDE}</div>`;
+      } else {
+        box.innerHTML = '<div class="empty-hint">← 选择人物查看全局长期记忆</div>';
+      }
       return;
     }
 
@@ -230,9 +278,10 @@
             <div>${sources || '<span class="muted">无来源</span>'}</div>
           </div>`;
         }).join('')
-      : '<div class="gm-empty">这个人目前没有长期印象</div>';
+      : '<div class="gm-empty">这个人目前没有长期印象。可以点上方“重新整理人物记忆”，或前往会话记忆页整理本群记忆。</div>';
     const manageable = /^\d{1,15}$/.test(String(person.userId || ''))
       && Boolean(sourceFor(person));
+    const action = actionState.key === person.key ? actionState : { kind: '', text: '' };
 
     box.innerHTML = `
       <div class="detail-header">
@@ -241,7 +290,7 @@
         <div class="gm-toolbar">
           <button class="btn btn-small" type="button" id="gm-consolidate" ${manageable ? '' : 'disabled'}>重新整理人物记忆</button>
           <button class="btn btn-small btn-danger" type="button" id="gm-delete" ${manageable ? '' : 'disabled'}>删除全部人物记忆</button>
-          <span class="gm-status" id="gm-action-status"></span>
+          <span class="${statusClass(action.kind)}" id="gm-action-status">${esc(action.text || '')}</span>
         </div>
       </div>
       <div class="gm-note">
@@ -252,17 +301,28 @@
       <div class="gm-section"><h3>长期印象</h3>${memoryHtml}</div>`;
 
     const status = box.querySelector('#gm-action-status');
+    const setAction = (kind, text) => {
+      actionState = { key: person.key, kind, text };
+      if (!status) return;
+      status.className = statusClass(kind);
+      status.textContent = text;
+    };
     box.querySelector('#gm-consolidate')?.addEventListener('click', async (event) => {
       const button = event.currentTarget;
       button.disabled = true;
-      if (status) status.textContent = '已提交整理任务…';
+      setAction('consolidating', '正在整理人物记忆…');
       try {
         await consolidatePerson(person);
-        if (status) status.textContent = '整理中，完成后会自动刷新';
+        setAction('consolidating', '整理中，完成后会自动刷新');
         setTimeout(() => loadGlobalMemory(true), 2500);
-        setTimeout(() => loadGlobalMemory(true), 7000);
+        setTimeout(() => {
+          if (actionState.key === person.key && actionState.kind === 'consolidating') {
+            setAction('done', '已刷新；若印象没有变化，说明模型认为无需调整');
+          }
+          loadGlobalMemory(true);
+        }, 7000);
       } catch (error) {
-        if (status) status.textContent = `整理失败：${error?.message || error}`;
+        setAction('error', `整理失败：${error?.message || error}`);
         button.disabled = false;
       }
     });
@@ -270,13 +330,14 @@
       if (!window.confirm(`确定删除 ${person.name || person.userId} 的全部全局人物记忆？此操作不会删除聊天记录。`)) return;
       const button = event.currentTarget;
       button.disabled = true;
-      if (status) status.textContent = '正在删除…';
+      setAction('consolidating', '正在删除…');
       try {
         await deletePerson(person);
         selectedKey = '';
+        actionState = { key: '', kind: '', text: '' };
         await loadGlobalMemory(true);
       } catch (error) {
-        if (status) status.textContent = `删除失败：${error?.message || error}`;
+        setAction('error', `删除失败：${error?.message || error}`);
         button.disabled = false;
       }
     });
@@ -286,19 +347,24 @@
     const ui = viewParts();
     if (!ui) return;
     const seq = ++loadSeq;
-    if (force || !people.length) {
-      ui.items.innerHTML = '<div class="gm-empty">正在读取全局人物记忆…</div>';
-    }
+    loadState = 'loading';
+    loadError = '';
+    if (force || !people.length) renderList();
     try {
       const next = await fetchPeople();
       if (seq !== loadSeq) return;
       people = next;
+      loadState = 'ready';
       if (selectedKey && !people.some((item) => item.key === selectedKey)) selectedKey = '';
       renderList();
       renderDetail();
     } catch (error) {
       if (seq !== loadSeq) return;
-      ui.items.innerHTML = `<div class="gm-empty">加载失败：${esc(error?.message || error)}</div>`;
+      // 后端故障必须显式显示为加载错误，不能伪装成“没有人物记忆”。
+      loadState = 'error';
+      loadError = String(error?.message || error);
+      renderList();
+      renderDetail();
     }
   }
 

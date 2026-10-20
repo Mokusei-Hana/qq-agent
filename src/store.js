@@ -250,6 +250,12 @@ export class ChatStore {
       AND state='pending' AND available_at<=?`).get(chatKey, Date.now()).n;
   }
 
+  /** 最近一条"真人"消息的时间；用于记忆冷启动判断近期是否真的有新消息。 */
+  lastIncomingTs(chatKey) {
+    const row = this.db.prepare('SELECT MAX(ts) AS ts FROM messages WHERE chat_key=? AND self=0').get(chatKey);
+    return Number(row?.ts) || 0;
+  }
+
   peekUnread(chatKey, limit = 3) {
     return this.db.prepare(`SELECT * FROM messages WHERE chat_key=? AND self=0
       AND state='pending' AND available_at<=? ORDER BY id LIMIT ?`)

@@ -2588,17 +2588,17 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
           // 手动触发：跳过门槛/冷却检查，且对零印象的人启用"新建印象"模式
           const force = body.force !== false;
 
-          if (orchestrator.consolidating.has(chatKey)) return json(res, 409, { ok: false, error: '该群已在整理中' });
-          orchestrator.consolidating.add(chatKey);
+          // 任务锁由 orchestrator 统一维护：同一 chatKey 同时只跑一个整理任务。
+          const task = orchestrator.startMemoryConsolidation(chatKey, { userIds, force });
+          if (!task) return json(res, 409, { ok: false, error: '该群已在整理中' });
           emit('memory-update', { chatKey, phase: 'consolidate-start', userIds });
-          orchestrator.consolidateMemoryForChat(chatKey, { userIds, force })
+          task
             .then((result) => {
               emit('memory-update', { chatKey, phase: 'consolidate-done', ...(result || {}) });
             })
             .catch((error) => {
               emit('memory-update', { chatKey, phase: 'consolidate-error', error: String(error?.message ?? error) });
-            })
-            .finally(() => orchestrator.consolidating.delete(chatKey));
+            });
           return json(res, 202, { ok: true, started: true });
         } catch (error) {
           return json(res, 400, { ok: false, error: String(error?.message ?? error) });

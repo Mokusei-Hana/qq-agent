@@ -137,11 +137,46 @@ export class MemoryStore {
   }
   consolidationState(chatKey) {
     const members = this.people.members(chatKey); const meta = readJson(metaFile(chatKey), {}) || {};
-    return { lastConsolidatedAt: Math.max(Number(meta.lastConsolidatedAt) || 0, ...members.map((m) => m.lastConsolidatedAt || 0)), counts: { memberImpression: members.reduce((n, m) => n + m.impressions.length, 0) }, members: members.map((m) => ({ userId: m.userId, name: m.name || m.userId, count: m.impressions.length, lastConsolidatedAt: m.lastConsolidatedAt || 0 })) };
+    return {
+      lastConsolidatedAt: Math.max(Number(meta.lastConsolidatedAt) || 0, ...members.map((m) => m.lastConsolidatedAt || 0)),
+      lastAttemptedAt: Number(meta.lastAttemptedAt) || 0,
+      lastResult: clean(meta.lastResult, 40),
+      lastError: clean(meta.lastError, 300),
+      consecutiveFailures: Math.max(0, Number(meta.consecutiveFailures) || 0),
+      counts: { memberImpression: members.reduce((n, m) => n + m.impressions.length, 0) },
+      members: members.map((m) => ({ userId: m.userId, name: m.name || m.userId, count: m.impressions.length, lastConsolidatedAt: m.lastConsolidatedAt || 0 }))
+    };
   }
-  markConsolidated(chatKey, at = Date.now(), userIds = []) {
+  /**
+   * 记录一次整理尝试（尝试时间与结果），与成功整理时间分开保存。
+   * running / no_targets / failed 都走这里，避免把"试过"误当成"成功"。
+   */
+  markConsolidationAttempt(chatKey, { at = Date.now(), result = '', error = '' } = {}) {
+    const when = Number(at) || Date.now();
+    fs.mkdirSync(chatDir(chatKey), { recursive: true });
+    const prev = readJson(metaFile(chatKey), {}) || {};
+    const outcome = clean(result, 40) || 'unknown';
+    writeJson(metaFile(chatKey), {
+      ...prev,
+      lastAttemptedAt: when,
+      lastResult: outcome,
+      lastError: clean(error, 300),
+      consecutiveFailures: Math.max(0, Number(prev.consecutiveFailures) || 0) + (outcome === 'failed' ? 1 : 0)
+    });
+  }
+  markConsolidated(chatKey, at = Date.now(), userIds = [], { result = 'success', error = '' } = {}) {
     const when = Number(at) || Date.now(); fs.mkdirSync(chatDir(chatKey), { recursive: true });
-    writeJson(metaFile(chatKey), { ...(readJson(metaFile(chatKey), {}) || {}), lastConsolidatedAt: when }); this.people.markConsolidated(userIds, when);
+    const prev = readJson(metaFile(chatKey), {}) || {};
+    const outcome = clean(result, 40) || 'success';
+    writeJson(metaFile(chatKey), {
+      ...prev,
+      lastConsolidatedAt: when,
+      lastAttemptedAt: Math.max(Number(prev.lastAttemptedAt) || 0, when),
+      lastResult: outcome,
+      lastError: clean(error, 300),
+      consecutiveFailures: Math.max(0, Number(prev.consecutiveFailures) || 0) + (outcome === 'success' ? 0 : 1)
+    });
+    this.people.markConsolidated(userIds, when);
   }
   replaceConsolidated(chatKey, next) {
     const groups = new Map();

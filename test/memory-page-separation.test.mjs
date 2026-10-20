@@ -30,11 +30,24 @@ test('global person memory renders only inside the dedicated people page', () =>
   assert.match(people, /来源会话只用于证据追溯/);
 });
 
-test('session memory page suppresses person-memory controls and keeps handoff visible', () => {
+test('session memory page keeps the consolidation entry and hides person-memory detail controls', () => {
   assert.match(session, /#view-memory #mem-add-imp-btn/);
-  assert.match(session, /#view-memory #mem-consolidate-btn/);
+  assert.doesNotMatch(session, /#view-memory #mem-consolidate-btn/);
+  assert.doesNotMatch(session, /#view-memory #mem-consolidate-status/);
   assert.match(session, /#view-memory #mem-load-members-btn/);
   assert.match(session, /\.collapsible:not\(\.memory-handoff\)/);
-  assert.match(session, /人物长期记忆已独立到“人物记忆”页/);
+  assert.match(session, /本页可以整理当前群的长期人物印象/);
+  assert.match(session, /人物印象明细请在“人物记忆”页查看/);
   assert.match(session, /会话级 handoff \/ 工作状态/);
+});
+
+test('people memory page guides the first consolidation and separates empty/loading/error states', () => {
+  assert.match(people, /还没有人物长期记忆。请前往会话记忆页，选择群聊并执行一次“整理本群记忆”。/);
+  assert.match(people, /id="gm-goto-session"/);
+  assert.match(people, /这个人目前没有长期印象/);
+  assert.match(people, /正在整理人物记忆/);
+  assert.match(people, /整理失败：/);
+  assert.match(people, /loadState === 'error'/);
+  assert.match(people, /人物记忆加载失败/);
+  assert.match(people, /人物记忆详情读取失败/);
 });
