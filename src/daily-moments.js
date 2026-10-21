@@ -228,6 +228,7 @@ export class DailyMomentsManager {
     onebot,
     sessions = null,
     resolveChatName = async () => '',
+    qzone = null,
     emit = null,
     complete = chatCompletionWithRetry,
     search = webSearch,
@@ -244,6 +245,7 @@ export class DailyMomentsManager {
     this.memory = memory;
     this.stickers = stickers;
     this.onebot = onebot;
+    this.qzone = qzone;
     this.sessions = sessions;
     this.resolveChatName = resolveChatName;
     this.emit = typeof emit === 'function' ? emit : () => {};
@@ -1354,9 +1356,12 @@ export class DailyMomentsManager {
   }
 
   async #findDuplicate(content, signal) {
-    const data = typeof this.onebot.getQzoneMoments === 'function'
-      ? await this.onebot.getQzoneMoments({ num: 30, signal })
-      : await this.onebot.call('get_qzone_msg_list', { pos: 0, num: 30 }, 30000, signal);
+    const qzone = this.qzone?.enabled ? this.qzone : null;
+    const data = qzone
+      ? await qzone.getMoments({ num: 30, signal })
+      : (typeof this.onebot.getQzoneMoments === 'function'
+        ? await this.onebot.getQzoneMoments({ num: 30, signal })
+        : await this.onebot.call('get_qzone_msg_list', { pos: 0, num: 30 }, 30000, signal));
     if (!Array.isArray(data?.msglist)) {
       throw momentError('MOMENT_CHECK_FAILED', '无法读取空间列表核对重复内容，本次未发起发布', 502);
     }
@@ -1369,6 +1374,15 @@ export class DailyMomentsManager {
     // #region debug-point D:moment-qzone-dispatch
     if (!process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'daily-moment-publish', runId: process.env.QQ_MOMENT_DEBUG_RUN || 'post-fix', hypothesisId: 'D', location: 'daily-moments:#publishMoment', msg: '[DEBUG] Qzone publish dispatch', data: { contentChars: content.length, imageCount: images.length, visibility: cfg.visibility }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_MOMENT_DEBUG_URL || 'http://192.168.31.10:7780/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
     // #endregion
+    const qzone = this.qzone?.enabled ? this.qzone : null;
+    if (qzone) {
+      return qzone.publishMoment(content, {
+        images,
+        ugcRight: cfg.visibility,
+        targetUins: cfg.targetUins,
+        signal
+      });
+    }
     if (typeof this.onebot.sendQzoneMoment === 'function') {
       return this.onebot.sendQzoneMoment(content, {
         images,

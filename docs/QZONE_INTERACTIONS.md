@@ -5,6 +5,13 @@
 - 每日动态负责汇总群聊并决定是否发布自己的说说。
 - 动态互动负责阅览好友动态、决定点赞/评论，并检查评论区的新回复。
 
+## 协议端
+
+空间扩展动作（`get_qzone_msg_list`、`get_qzone_feeds`、`send_qzone_msg`、
+`like_qzone`、`comment_qzone`）只有 SnowLuma 提供。使用 NapCat 时需要配置
+`qzoneBridge` 接入 [onebot-qzone](./QZONE_BRIDGE.md)，否则这些任务会报
+`不支持的Api`。
+
 ## 调度
 
 默认配置：

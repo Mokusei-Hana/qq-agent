@@ -117,6 +117,14 @@ export const DEFAULT_CONFIG = {
     accessToken: '',           // WebSocket 令牌
     httpAccessToken: ''        // HTTP API 令牌（SnowLuma 可与 WS 不同；留空沿用 accessToken）
   },
+  // QQ 空间扩展动作由独立的 onebot-qzone 桥接提供。
+  // 协议端换成 NapCat 后没有 get_qzone_msg_list 等接口，启用此项后每日动态和动态互动改走桥接。
+  qzoneBridge: {
+    enabled: false,
+    baseUrl: 'http://127.0.0.1:5700',
+    accessToken: '',
+    timeoutMs: 30000
+  },
   // 人设与行为
   persona: {
     botName: '小鲸鱼',

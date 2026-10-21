@@ -15,6 +15,7 @@ import { SessionRegistry } from './sessions.js';
 import { Orchestrator } from './orchestrator.js';
 import { DailyMomentsManager } from './daily-moments.js';
 import { QzoneInteractionManager } from './qzone-interactions.js';
+import { QzoneBridgeClient } from './qzone-bridge.js';
 import { listModels, chatCompletion, resolveApiKey, cachedTokensOfUsage } from './llm.js';
 import { resolveOfficialPrice, listOfficialPrices, isPeakHour, priceAt, resolveModelPrice, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
 import { initPriceFeed, refreshPriceFeed, priceFeedStatus } from './price-feed.js';
@@ -250,11 +251,13 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     getIdentityPilot: () => identityPilot,
     getIncidentPilot: () => incidentPilot
   });
+  const qzoneBridge = new QzoneBridgeClient();
   const dailyMoments = new DailyMomentsManager({
     store,
     memory,
     stickers,
     onebot,
+    qzone: qzoneBridge,
     sessions,
     resolveChatName: (groupId) => orchestrator.getChatName(groupId),
     setProactiveSuppressed: (suppressed) =>
@@ -264,6 +267,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
   });
   const qzoneInteractions = new QzoneInteractionManager({
     onebot,
+    qzone: qzoneBridge,
     sessions,
     setProactiveSuppressed: (suppressed) =>
       orchestrator.setProactiveSuppressed('qzone-interactions', suppressed),
