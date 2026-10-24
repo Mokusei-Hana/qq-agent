@@ -25,7 +25,7 @@ import { sleep, randInt, createEventBus, todayKey } from './util.js';
 import { buildSystemPrompt, buildUserPrompt, resolveContextTier } from './prompt.js';
 import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } from './llm.js';
 import { buildToolDefs, toOpenAiTools, executeTool, selectToolDefs } from './tools.js';
-import { moderationRequest, parseModerationRequest } from './group-moderation.js';
+import { moderationRequest, parseModerationRequest, autonomousBanEnabled } from './group-moderation.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 import { buildSlangContextForChat } from './asset-observer.js';
@@ -1096,9 +1096,13 @@ export class Orchestrator {
     const identityAvailable = identityPilotEnabled(cfg) && identityPilot?.active === true;
     const friendProposalAvailable = identityAvailable && promptFriendProposalEnabled(cfg);
     const currentModerationRequest = moderationRequest(triggerEntries, { proactive, manual, selfId: this.onebot.selfId });
+    const autonomousAvailable = kind === 'group' && !currentModerationRequest && !proactive && !manual
+      && triggerEntries.some((entry) => !entry.self && entry.eventKind === 'message')
+      && autonomousBanEnabled(chatId, cfg);
     const toolDefs = selectToolDefs(this.toolDefs, {
       kind, visionEnabled, searchEnabled, identityAvailable, friendProposalAvailable,
-      moderationAvailable: Boolean(currentModerationRequest)
+      moderationAvailable: Boolean(currentModerationRequest && !currentModerationRequest.noticeContent),
+      autonomousAvailable, noticeAvailable: Boolean(currentModerationRequest?.noticeContent)
     });
     const openAiTools = toOpenAiTools(toolDefs);
     const systemPrompt = buildSystemPrompt({
@@ -1160,6 +1164,7 @@ export class Orchestrator {
     const userPrompt = buildUserPrompt({
       chatKey, kind, chatId, chatName,
       moderationRequest: currentModerationRequest,
+      autonomousModerationAllowed: autonomousAvailable,
       triggerEntries,
       store: this.store,
       memory: this.memory,
@@ -1232,6 +1237,7 @@ export class Orchestrator {
     const ctx = {
       chatKey, kind, chatId,
       moderationRequest: currentModerationRequest,
+      autonomousModerationAllowed: autonomousAvailable,
       selfId: this.onebot.selfId,
       selfNickname,
       botName: cfg.persona.botName,

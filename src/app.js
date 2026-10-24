@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { conversationConfigForChat, getConfig, identityPilotEnabled, incidentPilotEnabled, slangPilotEnabled, updateConfig, onTimeControlChange, DATA_DIR, ROOT } from './config.js';
 import { customSearch } from './web-search.js';
 import { OneBotClient, segmentsToText, extractMediaFromSegments, expandForwardNodes } from './onebot.js';
+import { applyOwnerModerationControl } from './group-moderation.js';
 import { ChatStore } from './store.js';
 import { MemoryStore } from './memory.js';
 import { StickerManager } from './sticker-manager.js';
@@ -686,6 +687,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
       recordOnly: arrivedInactive || !isTimeActive(chatKey)
     });
     if (stored.duplicate) return;
+    if (!isSelf && kind === 'group') applyOwnerModerationControl(stored, chatKey, onebot.selfId);
     if (!isSelf) identityPilot?.observeMessage(chatKey, stored);
     if (!isSelf) slangPilot?.observeMessage(chatKey, stored);
     emit('chat-update', chatKey);

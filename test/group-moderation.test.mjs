@@ -7,8 +7,8 @@ import path from 'node:path';
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-group-moderation-'));
 process.env.QQ_AGENT_DATA_DIR = root;
 const { buildToolDefs, selectToolDefs, toOpenAiTools, executeTool } = await import('../src/tools.js');
-const { moderationRequesterId, moderationRequest, parseModerationRequest } = await import('../src/group-moderation.js');
-const { DEFAULT_CONFIG, setRuntimeConfig } = await import('../src/config.js');
+const { moderationRequesterId, moderationRequest, parseModerationRequest, applyOwnerModerationControl } = await import('../src/group-moderation.js');
+const { DEFAULT_CONFIG, setRuntimeConfig, getConfig } = await import('../src/config.js');
 const { ChatStore } = await import('../src/store.js');
 const { OneBotClient, OneBotActionError } = await import('../src/onebot.js');
 const { chatCompletion } = await import('../src/llm.js');
@@ -262,4 +262,63 @@ test('OneBot rejects inconsistent success envelopes and HTTP errors', async (t) 
   }
   t.mock.method(globalThis, 'fetch', async () => new Response('private', { status: 500 }));
   await assert.rejects(client.call('set_group_ban', {}), (e) => e.outcome === 'unknown');
+});
+
+test('autonomous ban defaults to 60 seconds, deduplicates and obeys persisted owner pause', async (t) => {
+  const { ctx, calls, invoke } = fixture(t);
+  ctx.moderationRequest = null;
+  ctx.autonomousModerationAllowed = true;
+  assert.ok(selectToolDefs(buildToolDefs(), { ...availability, moderationAvailable: false,
+    autonomousAvailable: true }).some((tool) => tool.name === 'set_group_ban'));
+  assert.equal(JSON.parse((await invoke({ user_id: TARGET })).content).duration, 60);
+  await invoke({ user_id: TARGET });
+  assert.equal(calls.filter((call) => call.action === 'set_group_ban').length, 1);
+  assert.equal((await invoke({ user_id: TARGET, duration: 61 })).isError, true);
+  assert.equal((await invoke({ user_id: TARGET, duration: 0 })).isError, true);
+  assert.equal(applyOwnerModerationControl({ senderId: ADMIN, text: '暂停自主禁言' }, ctx.chatKey), false);
+  assert.equal(applyOwnerModerationControl({ senderId: OWNER, text: '暂停自主禁言' }, ctx.chatKey), true);
+  assert.equal(getConfig().groupModeration.pausedGroups[GROUP], true);
+  assert.equal((await invoke()).isError, true);
+  assert.equal(applyOwnerModerationControl({ senderId: OWNER, text: '恢复自主禁言' }, ctx.chatKey), true);
+  assert.equal(getConfig().groupModeration.pausedGroups[GROUP], false);
+  assert.ok(buildToolDefs().every((tool) => !/kick|remove_member|set_group_admin/.test(tool.name)));
+});
+
+test('notice registration, visibility and authorized success use NapCat API once', async (t) => {
+  const { ctx, calls } = fixture(t);
+  ctx.moderationRequest = parseModerationRequest({ senderId: OWNER, text: '发布群公告：明晚八点活动' });
+  assert.ok(selectToolDefs(buildToolDefs(), { ...availability, noticeAvailable: true })
+    .some((tool) => tool.name === 'send_group_notice'));
+  const invoke = () => executeTool(buildToolDefs(), ctx, 'send_group_notice', '{"content":"明晚八点活动"}');
+  assert.equal(JSON.parse((await invoke()).content).success, true);
+  await invoke();
+  assert.deepEqual(calls.filter((call) => call.action === '_send_group_notice'), [
+    { action: '_send_group_notice', params: { group_id: GROUP, content: '明晚八点活动' } }
+  ]);
+  ctx.onebot.call = async (_action, params) => ({ ...params, role: 'member' });
+  assert.equal((await invoke()).errorCode, 'BOT_PERMISSION_DENIED');
+});
+
+test('notice rejection/unknown never reports success and unknown is not retried', async (t) => {
+  for (const outcome of ['failed', 'unknown']) {
+    const { ctx, store } = fixture(t);
+    ctx.moderationRequest = { requesterId: OWNER, noticeContent: '公告测试' };
+    const original = ctx.onebot.call;
+    let writes = 0;
+    ctx.onebot.call = async (action, params) => {
+      if (action !== '_send_group_notice') return original(action, params);
+      writes++;
+      throw new OneBotActionError('permission or network error', { outcome, retcode: 1200 });
+    };
+    const invoke = () => executeTool(buildToolDefs(), ctx, 'send_group_notice', '{"content":"公告测试"}');
+    const result = await invoke();
+    assert.equal(result.isError, true);
+    assert.equal(result.outcome, outcome);
+    if (outcome === 'unknown') {
+      ctx.session = { leaseId: 'next-run' };
+      assert.equal((await invoke()).errorCode, 'UNKNOWN_PREVIOUS_OPERATION');
+      assert.equal(store.listUnknownOperations(ctx.chatKey)[0].payload.type, 'group_notice');
+    } else await invoke();
+    assert.equal(writes, 1);
+  }
 });

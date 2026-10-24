@@ -143,21 +143,24 @@ describe('Orchestrator', () => {
           arguments: '{"user_id":"567890","duration":60}' }
       }] } }], usage: { total_tokens: 10 } });
       const result = body.messages.findLast((m) => m.role === 'tool');
-      if (rounds === 2) assert.equal(JSON.parse(result.content).success, true);
-      else assert.match(result.content, /不是配置主人/);
+      if (rounds === 4) assert.match(result.content, /不是配置主人/);
+      else assert.equal(JSON.parse(result.content).success, true);
       return Response.json({ choices: [{ message: { content: 'done' } }], usage: { total_tokens: 10 } });
     };
     store.appendIncoming('group:123456', { mid: '1', senderId: '345678', text: '禁言 567890 1分钟' });
     await runner.wake('group:123456');
     store.appendIncoming('group:123456', { mid: '2', senderId: '456789', text: '禁言 567890 1分钟' });
     await runner.wake('group:123456');
-    assert.equal(rounds, 4);
-    assert.deepEqual(writes, [{ group_id: '123456', user_id: '567890', duration: 60 }]);
+    store.appendIncoming('group:123456', { mid: '3', senderId: '456789', text: '日常斗嘴' });
+    await runner.wake('group:123456');
+    assert.equal(rounds, 6);
+    assert.deepEqual(writes, Array.from({ length: 2 }, () => ({ group_id: '123456', user_id: '567890', duration: 60 })));
   });
 
   it('isolates explicit moderation leases and never lends an admin message to another sender', async (t) => {
     const { runner, store, cfg, sessions } = fixture(t);
     cfg.allow.groups = ['123456']; cfg.admin = { ownerUin: '345678' };
+    cfg.groupModeration = { pausedGroups: { '123456': true } };
     setRuntimeConfig(cfg);
     t.mock.method(runner, 'scheduleWake', () => {});
     runner.onebot.selfId = '234567';

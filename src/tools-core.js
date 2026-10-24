@@ -10,7 +10,7 @@ import { validateImageUrl, safeFetchBinary } from './safe-fetch.js';
 import { webSearch, webFetch } from './web-search.js';
 import { expandForwardNodes, extractMediaFromSegments } from './onebot.js';
 import { prepareImageDataUrls } from './image-prep.js';
-import { groupBanTool } from './group-moderation.js';
+import { groupBanTool, groupNoticeTool } from './group-moderation.js';
 
 const MAX_IMAGES_PER_VIEW = 12;
 
@@ -200,6 +200,7 @@ function imageParts(text, dataUrls) {
 export function buildToolDefs() {
   return [
     groupBanTool(),
+    groupNoticeTool(),
     {
       name: 'send_message',
       description: '发送消息到当前聊天（本工具只能发到本次会话对应的群/私聊）。messages 传字符串=发一条；传字符串数组=分多条发送（推荐，更像真人）。只有需要明确"我回的是哪条"时才传 replyToMessageId 引用；需要点名某人才传 atUserId。不要在字符串内部用空格分句。',

@@ -22,7 +22,8 @@ export * from './tools-core.js';
 export const buildToolDefs = coreBuildToolDefs;
 
 export function selectToolDefs(defs, { kind, visionEnabled, searchEnabled,
-  identityAvailable, friendProposalAvailable, moderationAvailable = false }) {
+  identityAvailable, friendProposalAvailable, moderationAvailable = false, autonomousAvailable = false,
+  noticeAvailable = false }) {
   const excluded = [];
   const selected = defs.filter((d) => {
     let reason = '';
@@ -31,7 +32,8 @@ export function selectToolDefs(defs, { kind, visionEnabled, searchEnabled,
     else if (d.feature === 'identityPilot' && !identityAvailable) reason = 'identity_unavailable';
     else if (d.feature === 'friendProposal' && !friendProposalAvailable) reason = 'friend_proposal_unavailable';
     else if (d.name === 'set_group_ban' && kind !== 'group') reason = 'group_only';
-    else if (d.name === 'set_group_ban' && !moderationAvailable) reason = 'no_explicit_moderation_request';
+    else if (d.name === 'set_group_ban' && !moderationAvailable && !autonomousAvailable) reason = 'no_explicit_moderation_request';
+    else if (d.name === 'send_group_notice' && (kind !== 'group' || !noticeAvailable)) reason = 'no_explicit_notice_request';
     if (reason) excluded.push({ name: d.name, reason });
     return !reason;
   });
