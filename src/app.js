@@ -639,6 +639,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
         }
       }
       text = await segmentsToText(segments, {
+        includeAtIds: true,
         resolveReply: (mid) => (
           reply && String(reply.messageId) === String(mid)
             ? reply

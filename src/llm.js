@@ -204,6 +204,12 @@ export async function chatCompletion({
     const data = await res.json();
     const choice = data?.choices?.[0];
     if (!choice) throw new Error('模型 API 响应缺少 choices');
+    if (process.env.QQ_AGENT_TOOL_DEBUG === '1') {
+      console.info('[tools] model response', JSON.stringify({
+        names: (choice.message?.tool_calls || []).map((call) => call.function?.name)
+          .filter((name) => (tools || []).some((tool) => tool.function?.name === name))
+      }));
+    }
     return {
       message: choice.message ?? {}, finishReason: choice.finish_reason ?? null,
       usage: data.usage ?? null, model: data.model ?? api.model, raw: data

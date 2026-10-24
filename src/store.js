@@ -307,17 +307,20 @@ export class ChatStore {
     return messages;
   }
 
-  claimUnread(chatKey, { limit = 100, maxChars = 32000, leaseMs = 240000 } = {}) {
+  claimUnread(chatKey, { limit = 100, maxChars = 32000, leaseMs = 240000, isolateMessage = null } = {}) {
     return this.#transaction(() => {
       if (this.db.prepare("SELECT 1 FROM runs WHERE chat_key=? AND state='leased'").get(chatKey)) return null;
       const pending = this.peekUnread(chatKey, Math.min(100, Math.max(1, limit)));
       const messages = [];
       let chars = 0;
       for (const m of pending) {
+        // Preserve order and leave all other messages pending for later leases.
+        if (messages.length && isolateMessage?.(m)) break;
         const length = Math.min(m.text.length, 2000) + 100;
         if (messages.length && chars + length > maxChars) break;
         messages.push({ ...m, text: m.text.length > 2000 ? `${m.text.slice(0, 2000)} [truncated; use get_message_detail]` : m.text });
         chars += length;
+        if (isolateMessage?.(m)) break;
       }
       if (!messages.length) return null;
       const id = crypto.randomUUID();

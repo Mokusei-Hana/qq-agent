@@ -25,7 +25,7 @@ import { sleep, randInt, createEventBus, todayKey } from './util.js';
 import { buildSystemPrompt, buildUserPrompt, resolveContextTier } from './prompt.js';
 import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } from './llm.js';
 import { buildToolDefs, toOpenAiTools, executeTool, selectToolDefs } from './tools.js';
-import { moderationRequesterId } from './group-moderation.js';
+import { moderationRequest, parseModerationRequest } from './group-moderation.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 import { buildSlangContextForChat } from './asset-observer.js';
@@ -310,6 +310,10 @@ export class Orchestrator {
     const cfg = getConfig();
     const conversation = conversationConfigForChat(chatKey);
     const entries = this.store.peekUnread(chatKey, 100) || [];
+    if (chatKey.startsWith('group:') && entries.some((entry) => parseModerationRequest(entry, this.onebot.selfId))) {
+      return { shouldRespond: true, tier: 1, count: cfg.store.atCount,
+        reason: '独立群管理请求', conversationMode: conversation.mode };
+    }
     if (chatKey.startsWith('private:')) {
       return {
         shouldRespond: entries.length > 0,
@@ -706,7 +710,9 @@ export class Orchestrator {
 
     const runTimeoutMs = Math.min(240000, Math.max(1000, Number(cfgNow.api.runTimeoutMs) || 180000));
     const lease = proactive ? null : this.store.claimUnread(chatKey, {
-      limit: cfgNow.store.batchLimit, maxChars: cfgNow.store.batchMaxChars, leaseMs: runTimeoutMs + 60000
+      limit: cfgNow.store.batchLimit, maxChars: cfgNow.store.batchMaxChars, leaseMs: runTimeoutMs + 60000,
+      isolateMessage: chatKey.startsWith('group:')
+        ? (entry) => Boolean(parseModerationRequest(entry, this.onebot.selfId)) : null
     });
     const triggerEntries = lease?.messages || [];
     if (!proactive && triggerEntries.length === 0) {
@@ -1089,8 +1095,10 @@ export class Orchestrator {
     const identityPilot = this.getIdentityPilot();
     const identityAvailable = identityPilotEnabled(cfg) && identityPilot?.active === true;
     const friendProposalAvailable = identityAvailable && promptFriendProposalEnabled(cfg);
+    const currentModerationRequest = moderationRequest(triggerEntries, { proactive, manual, selfId: this.onebot.selfId });
     const toolDefs = selectToolDefs(this.toolDefs, {
-      kind, visionEnabled, searchEnabled, identityAvailable, friendProposalAvailable
+      kind, visionEnabled, searchEnabled, identityAvailable, friendProposalAvailable,
+      moderationAvailable: Boolean(currentModerationRequest)
     });
     const openAiTools = toOpenAiTools(toolDefs);
     const systemPrompt = buildSystemPrompt({
@@ -1151,6 +1159,7 @@ export class Orchestrator {
     // 首轮带完整上下文；生命周期后续轮只附加增量，旧消息保持字节级稳定以命中 DeepSeek 前缀缓存。
     const userPrompt = buildUserPrompt({
       chatKey, kind, chatId, chatName,
+      moderationRequest: currentModerationRequest,
       triggerEntries,
       store: this.store,
       memory: this.memory,
@@ -1222,7 +1231,7 @@ export class Orchestrator {
 
     const ctx = {
       chatKey, kind, chatId,
-      moderationRequesterId: moderationRequesterId(triggerEntries, { proactive, manual }),
+      moderationRequest: currentModerationRequest,
       selfId: this.onebot.selfId,
       selfNickname,
       botName: cfg.persona.botName,

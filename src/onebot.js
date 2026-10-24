@@ -335,7 +335,7 @@ export function forwardIdFromData(d) {
  * resolveReply: async (mid) => { sender, text } | null —— 解析引用原文。
  * resolveAtName: async (qq) => string | null —— 把 @ 的 QQ 号解析成群名片。
  */
-export async function segmentsToText(segments, { resolveReply = null, resolveAtName = null, includeReply = true } = {}) {
+export async function segmentsToText(segments, { resolveReply = null, resolveAtName = null, includeReply = true, includeAtIds = false } = {}) {
   if (typeof segments === 'string') return sanitizeUserText(segments.trim());
   const out = [];
   for (const seg of segments ?? []) {
@@ -348,7 +348,7 @@ export async function segmentsToText(segments, { resolveReply = null, resolveAtN
         } else {
           let name = null;
           try { name = resolveAtName ? await resolveAtName(String(d.qq)) : null; } catch { name = null; }
-          out.push(name ? `@${name}` : `@${d.qq}`);
+          out.push(name ? (includeAtIds ? `@${name}(${d.qq})` : `@${name}`) : `@${d.qq}`);
         }
         break;
       }
