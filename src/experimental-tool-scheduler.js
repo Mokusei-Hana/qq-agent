@@ -33,6 +33,7 @@ export const EXPERIMENTAL_TERMINAL_TOOL = 'finish';
 // 这些工具的副作用必须保持宿主原有顺序，但当动作在模型调用前就已经全部确定时，
 // 可以与 finish 放在同一个 assistant tool_calls 批次里；finish 的失败屏障保证前置失败时不提交。
 export const EXPERIMENTAL_SAME_ROUND_ACTION_TOOLS = new Set([
+  'set_group_ban',
   'send_message',
   'send_sticker',
   'send_poke',

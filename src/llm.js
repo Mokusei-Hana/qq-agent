@@ -160,6 +160,11 @@ export async function chatCompletion({
     body.tools = tools;
     body.tool_choice = toolChoice;
   }
+  if (process.env.QQ_AGENT_TOOL_DEBUG === '1') {
+    console.info('[tools] model request', JSON.stringify({
+      names: (body.tools || []).map((tool) => tool.function?.name)
+    }));
+  }
   const temp = temperature === null ? (api.temperature ?? 0.8) : temperature;
   if (temp !== null && temp !== undefined && Number.isFinite(Number(temp))) body.temperature = Number(temp);
   if (Number.isFinite(Number(maxTokens)) && Number(maxTokens) > 0) {

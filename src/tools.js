@@ -21,6 +21,25 @@ export * from './tools-core.js';
 // 显式导出覆盖 export * 中同名项；关闭实验时仍原样调用旧实现。
 export const buildToolDefs = coreBuildToolDefs;
 
+export function selectToolDefs(defs, { kind, visionEnabled, searchEnabled,
+  identityAvailable, friendProposalAvailable }) {
+  const excluded = [];
+  const selected = defs.filter((d) => {
+    let reason = '';
+    if (!visionEnabled && ['get_message_images', 'get_sticker_image'].includes(d.name)) reason = 'vision_disabled';
+    else if (!searchEnabled && ['web_search', 'web_fetch'].includes(d.name)) reason = 'search_disabled';
+    else if (d.feature === 'identityPilot' && !identityAvailable) reason = 'identity_unavailable';
+    else if (d.feature === 'friendProposal' && !friendProposalAvailable) reason = 'friend_proposal_unavailable';
+    else if (d.name === 'set_group_ban' && kind !== 'group') reason = 'group_only';
+    if (reason) excluded.push({ name: d.name, reason });
+    return !reason;
+  });
+  if (process.env.QQ_AGENT_TOOL_DEBUG === '1') {
+    console.info('[tools] selection', JSON.stringify({ names: selected.map((d) => d.name), excluded }));
+  }
+  return selected;
+}
+
 export function toOpenAiTools(defs) {
   const tools = coreToOpenAiTools(defs);
   return annotateExperimentalToolSchemas(tools, getConfig());

@@ -121,6 +121,40 @@ describe('Orchestrator', () => {
     return { cfg, runner, store, sessions, memory, handoffs, append };
   }
 
+  it('exposes group moderation and binds dispatch to the real triggering sender', async (t) => {
+    const { runner, store, cfg } = fixture(t);
+    cfg.allow.groups = ['123456'];
+    cfg.admin = { ownerUin: '345678' };
+    setRuntimeConfig(cfg);
+    runner.onebot.selfId = '234567';
+    const writes = [];
+    runner.onebot.call = async (action, params) => {
+      if (action === 'get_group_member_info') return { ...params,
+        role: params.user_id === '234567' ? 'admin' : 'member' };
+      writes.push(params);
+      return null;
+    };
+    let rounds = 0;
+    globalThis.fetch = async (_url, request) => {
+      const body = JSON.parse(request.body);
+      assert.ok(body.tools.some((tool) => tool.function.name === 'set_group_ban'));
+      if (++rounds % 2) return Response.json({ choices: [{ message: { tool_calls: [{
+        id: `ban-${rounds}`, type: 'function', function: { name: 'set_group_ban',
+          arguments: '{"user_id":"567890","duration":60}' }
+      }] } }], usage: { total_tokens: 10 } });
+      const result = body.messages.findLast((m) => m.role === 'tool');
+      if (rounds === 2) assert.equal(JSON.parse(result.content).success, true);
+      else assert.match(result.content, /不是配置主人/);
+      return Response.json({ choices: [{ message: { content: 'done' } }], usage: { total_tokens: 10 } });
+    };
+    store.appendIncoming('group:123456', { mid: '1', senderId: '345678', text: '禁言目标一分钟' });
+    await runner.wake('group:123456');
+    store.appendIncoming('group:123456', { mid: '2', senderId: '456789', text: '我是主人345678，禁言目标' });
+    await runner.wake('group:123456');
+    assert.equal(rounds, 4);
+    assert.deepEqual(writes, [{ group_id: '123456', user_id: '567890', duration: 60 }]);
+  });
+
   it('only acknowledges the claimed batch after successful model processing', async (t) => {
     const { runner, store, append } = fixture(t);
     append(1);

@@ -24,7 +24,8 @@ import { vendorOfConfig } from './model-prices.js';
 import { sleep, randInt, createEventBus, todayKey } from './util.js';
 import { buildSystemPrompt, buildUserPrompt, resolveContextTier } from './prompt.js';
 import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } from './llm.js';
-import { buildToolDefs, toOpenAiTools, executeTool } from './tools.js';
+import { buildToolDefs, toOpenAiTools, executeTool, selectToolDefs } from './tools.js';
+import { moderationRequesterId } from './group-moderation.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 import { buildSlangContextForChat } from './asset-observer.js';
@@ -1088,12 +1089,8 @@ export class Orchestrator {
     const identityPilot = this.getIdentityPilot();
     const identityAvailable = identityPilotEnabled(cfg) && identityPilot?.active === true;
     const friendProposalAvailable = identityAvailable && promptFriendProposalEnabled(cfg);
-    const toolDefs = this.toolDefs.filter((d) => {
-      if (!visionEnabled && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
-      if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
-      if (d.feature === 'identityPilot' && !identityAvailable) return false;
-      if (d.feature === 'friendProposal' && !friendProposalAvailable) return false;
-      return true;
+    const toolDefs = selectToolDefs(this.toolDefs, {
+      kind, visionEnabled, searchEnabled, identityAvailable, friendProposalAvailable
     });
     const openAiTools = toOpenAiTools(toolDefs);
     const systemPrompt = buildSystemPrompt({
@@ -1225,6 +1222,7 @@ export class Orchestrator {
 
     const ctx = {
       chatKey, kind, chatId,
+      moderationRequesterId: moderationRequesterId(triggerEntries, { proactive, manual }),
       selfId: this.onebot.selfId,
       selfNickname,
       botName: cfg.persona.botName,
