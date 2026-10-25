@@ -35,6 +35,9 @@ export class OneBotClient {
     this.everConnected = false;
     this.lastConnectError = '';
     this.selfInfo = null;      // { user_id, nickname }
+    // get_version_info 返回的实现名（NapCat / SnowLuma）。空间扩展动作只有
+    // SnowLuma 提供，NapCat 需要走 qzoneBridge，调用方据此给出明确提示。
+    this.appName = '';
     this.#closedByUs = false;
     this.statusListeners = new Set();
     this.reconnectTimer = null;
@@ -122,6 +125,10 @@ export class OneBotClient {
       } catch (error) {
         console.error('[onebot] 获取登录信息失败:', error?.message ?? error);
       }
+      try {
+        const version = await this.call('get_version_info');
+        this.appName = String(version?.app_name || '');
+      } catch { /* 实现不支持 get_version_info 时保持未知 */ }
     });
     socket.on('message', (data) => {
       if (!isCurrent(socket)) return;

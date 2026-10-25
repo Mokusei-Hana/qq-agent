@@ -24,6 +24,18 @@ export function qzoneBridgeSettings(raw = getConfig().qzoneBridge || {}) {
   };
 }
 
+// OneBot 实现只有 SnowLuma 提供 get_qzone_msg_list / send_qzone_msg 等扩展动作。
+// NapCat 会返回 retcode=200「不支持的Api」，必须改走 qzoneBridge。
+export function onebotNeedsQzoneBridge(onebot) {
+  return /napcat/i.test(String(onebot?.appName || ''));
+}
+
+export function qzoneBridgeRequiredMessage(onebot, feature = 'QQ 空间操作') {
+  const impl = String(onebot?.appName || '').trim() || '当前 OneBot 实现';
+  return `${feature}需要 QQ 空间桥接（qzoneBridge）：${impl} 不提供 SnowLuma 空间扩展动作。`
+    + '请在 config.json 中启用 qzoneBridge（baseUrl + accessToken），并确认 onebot-qzone 服务正在运行。';
+}
+
 export class QzoneBridgeError extends Error {
   constructor(message, { action = '', retcode = null, httpStatus = null, cause } = {}) {
     super(message, cause ? { cause } : undefined);

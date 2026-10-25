@@ -26,6 +26,7 @@ import {
   shanghaiDayStart,
   todayKey
 } from './util.js';
+import { onebotNeedsQzoneBridge, qzoneBridgeRequiredMessage } from './qzone-bridge.js';
 
 const STATE_FILE = path.join(DATA_DIR, 'daily-moments.json');
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -1369,6 +1370,13 @@ export class DailyMomentsManager {
 
   async #findDuplicate(content, signal) {
     const qzone = this.qzone?.enabled ? this.qzone : null;
+    if (!qzone && onebotNeedsQzoneBridge(this.onebot)) {
+      throw momentError(
+        'MOMENT_QZONE_BRIDGE_REQUIRED',
+        qzoneBridgeRequiredMessage(this.onebot, '读取空间列表核对重复内容'),
+        503
+      );
+    }
     const data = qzone
       ? await qzone.getMoments({ num: 30, signal })
       : (typeof this.onebot.getQzoneMoments === 'function'
@@ -1402,6 +1410,13 @@ export class DailyMomentsManager {
         targetUins: cfg.targetUins,
         signal
       });
+    }
+    if (onebotNeedsQzoneBridge(this.onebot)) {
+      throw momentError(
+        'MOMENT_QZONE_BRIDGE_REQUIRED',
+        qzoneBridgeRequiredMessage(this.onebot, '发布说说'),
+        503
+      );
     }
     const params = {
       content,

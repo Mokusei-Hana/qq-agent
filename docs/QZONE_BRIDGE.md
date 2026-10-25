@@ -31,6 +31,11 @@ NapCat，两者互不影响。
 关闭时（默认）继续调用 OneBot 端的 SnowLuma 动作。运行中改开关不需要重启，
 下一次空间任务就会按新值选择通道。
 
+NapCat 检测到 `get_version_info.app_name` 含 `NapCat` 且桥接关闭时，空间任务会
+直接报 `MOMENT_QZONE_BRIDGE_REQUIRED` / `QZONE_BRIDGE_REQUIRED`，不再把
+注定失败的 `get_qzone_msg_list` 等动作发给协议端。看到提示后按上面的配置启用
+桥接即可，`accessToken` 必须与桥接 `.env` 的 `ONEBOT_ACCESS_TOKEN` 一致。
+
 ## 动作对应关系
 
 | qq-agent 需要 | onebot-qzone 动作 |

@@ -22,6 +22,7 @@ import {
   qzoneInteractionPersonaHash,
   QZONE_INTERACTION_PROMPT_VERSION
 } from './qzone-interaction-prompt.js';
+import { onebotNeedsQzoneBridge, qzoneBridgeRequiredMessage } from './qzone-bridge.js';
 
 const STATE_FILE = path.join(DATA_DIR, 'qzone-interactions.json');
 const HOUR_MS = 60 * 60 * 1000;
@@ -49,6 +50,20 @@ function writeJson(file, value) {
 
 function interactionError(code, message, httpStatus = 409) {
   return Object.assign(new Error(message), { code, httpStatus });
+}
+
+// 桥接关闭时只有 SnowLuma 能处理空间动作；NapCat 会返回「不支持的Api」，
+// 这里直接给出可操作的配置错误，避免把无效请求发给协议端。
+function qzoneChannel(qzone, onebot, feature) {
+  if (qzone?.enabled) return qzone;
+  if (onebotNeedsQzoneBridge(onebot)) {
+    throw interactionError(
+      'QZONE_BRIDGE_REQUIRED',
+      qzoneBridgeRequiredMessage(onebot, feature),
+      503
+    );
+  }
+  return null;
 }
 
 function normalizedConfig(raw = getConfig().qzoneInteractions || {}) {
@@ -524,7 +539,7 @@ export class QzoneInteractionManager {
   }
 
   async #discoverFeeds(cfg, signal) {
-    const qzone = this.qzone?.enabled ? this.qzone : null;
+    const qzone = qzoneChannel(this.qzone, this.onebot, '读取好友动态');
     let posts;
     if (qzone) {
       posts = await qzone.getFeedPosts({ count: cfg.feedFetchCount, signal });
@@ -572,7 +587,7 @@ export class QzoneInteractionManager {
   async #discoverReplies(cfg, signal) {
     const selfId = String(this.onebot.selfId || '');
     if (!selfId) throw new Error('无法确认当前登录 QQ');
-    const qzone = this.qzone?.enabled ? this.qzone : null;
+    const qzone = qzoneChannel(this.qzone, this.onebot, '读取自己的说说');
     const own = qzone
       ? await qzone.getMoments({ num: cfg.ownPostCount, signal })
       : await this.onebot.call(
@@ -891,7 +906,7 @@ export class QzoneInteractionManager {
   async #executePlan(plan, batch, cfg, signal, run) {
     const feedMap = new Map(batch.feeds.map((item) => [item.id, item.state]));
     const replyMap = new Map(batch.replies.map((item) => [item.id, item.state]));
-    const qzone = this.qzone?.enabled ? this.qzone : null;
+    const qzone = qzoneChannel(this.qzone, this.onebot, '执行空间互动');
     let writes = 0;
     for (const action of plan.replyActions) {
       const item = replyMap.get(action.id);

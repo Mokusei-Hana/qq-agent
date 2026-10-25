@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { QzoneBridgeClient, QzoneBridgeError, mapBridgeComments } from '../src/qzone-bridge.js';
+import { QzoneBridgeClient, QzoneBridgeError, mapBridgeComments, onebotNeedsQzoneBridge, qzoneBridgeRequiredMessage } from '../src/qzone-bridge.js';
 
 function clientWith(handler, settings = {}) {
   const calls = [];
@@ -189,4 +189,15 @@ test('stays disabled until explicitly enabled', () => {
   });
   assert.equal(client.enabled, false);
   assert.equal(client.settings.baseUrl, 'http://127.0.0.1:5700');
+});
+
+test('detects NapCat and explains that Qzone actions need the bridge', () => {
+  assert.equal(onebotNeedsQzoneBridge({ appName: 'NapCat.Onebot' }), true);
+  assert.equal(onebotNeedsQzoneBridge({ appName: 'SnowLuma' }), false);
+  assert.equal(onebotNeedsQzoneBridge({}), false);
+  const message = qzoneBridgeRequiredMessage({ appName: 'NapCat.Onebot' }, '发布说说');
+  assert.match(message, /发布说说/);
+  assert.match(message, /NapCat/);
+  assert.match(message, /qzoneBridge/);
+  assert.match(message, /accessToken/);
 });
