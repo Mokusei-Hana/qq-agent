@@ -32,6 +32,10 @@ export function normalizeStickerEntry(raw) {
     source: entry.source === 'manual' ? 'manual' : (entry.source === 'ai' ? 'ai' : 'qq'),
     hidden: entry.hidden === true,
     metadataEdited: entry.metadataEdited === true,
+    // 远端图片地址（QQ rkey / 图床临时签名）被判定失效的时间戳。
+    // 0 表示未判定失效。失效条目不参与提示词与列表，避免模型挑中发不出去的表情。
+    imageUnavailableAt: Math.max(0, Number(entry.imageUnavailableAt) || 0),
+    imageUnavailableReason: String(entry.imageUnavailableReason ?? '').slice(0, 200),
     useCount: Math.max(0, Number(entry.useCount) || 0),
     lastUsedAt: Number(entry.lastUsedAt) || 0,
     lastContext: String(entry.lastContext ?? '').slice(0, 200),
@@ -138,7 +142,7 @@ export function findSticker(entries, ref) {
 export function formatStickerList(entries, query = '', limit = 48) {
   const list = (Array.isArray(entries) ? entries : [])
     .map(normalizeStickerEntry)
-    .filter((entry) => entry && !entry.hidden);
+    .filter((entry) => entry && !entry.hidden && !entry.imageUnavailableAt);
   const q = String(query ?? '').trim().toLowerCase();
   const filtered = q
     ? list.filter((e) => {
@@ -161,7 +165,7 @@ export function formatStickerList(entries, query = '', limit = 48) {
 export function buildStickerContext(entries, max = 10) {
   const list = (Array.isArray(entries) ? entries : [])
     .map(normalizeStickerEntry)
-    .filter((entry) => entry && !entry.hidden);
+    .filter((entry) => entry && !entry.hidden && !entry.imageUnavailableAt);
   if (!list.length) return '';
   const top = [...list]
     .sort((a, b) => (b.useCount || 0) - (a.useCount || 0) || ((b.desc || b.localNote) ? 1 : 0) - ((a.desc || a.localNote) ? 1 : 0))

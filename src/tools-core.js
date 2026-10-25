@@ -253,14 +253,15 @@ export function buildToolDefs() {
       },
       async execute(ctx, args) {
         try {
-          const sticker = await ctx.stickers.findForSend(unquoteJsonString(args.stickerId));
-          if (!sticker) return err(`找不到表情 ${args.stickerId}，请先用 list_stickers 获取有效 id`);
+          const sticker = await ctx.stickers.findForSend(unquoteJsonString(args.stickerId), { signal: ctx.signal });
+          if (!sticker) {
+            return err(`表情 ${args.stickerId} 现在发不出去（图片地址已失效且本地没有缓存），已把它从可选列表里移除。请用 list_stickers 换一个，或改用 send_message 发文字。`);
+          }
           if (!sticker.url) return err(`表情 ${sticker.id} 没有可发送的图片地址`);
           const targetError = messageTargetError(ctx, args);
           if (targetError) return err(targetError);
-          const managedInline = sticker.source === 'manual'
-            && Boolean(sticker.localFile)
-            && sticker.url.startsWith('base64://');
+          // 内联发送（base64://）不再区分来源：手动表情和已本地化的收藏表情都走这条路径。
+          const managedInline = sticker.url.startsWith('base64://');
           // #region debug-point C-D:sticker-resolution
           if (!String(process.argv[1]).includes('/test/')) (() => { try { let host = '', pathname = '', queryKeys = []; if (!managedInline) { const parsed = new URL(sticker.url); host = parsed.host; pathname = parsed.pathname; queryKeys = [...parsed.searchParams.keys()]; } const body = JSON.stringify({ sessionId: 'agent-time-sticker-download', runId: 'post-fix', hypothesisId: 'C,D', location: 'src/tools.js:send_sticker', msg: '[DEBUG] Resolved sticker before OneBot delivery', data: { stickerId: sticker.id, source: sticker.source, transport: managedInline ? 'managed-base64' : 'remote-http', host, pathname, queryKeys, urlLength: sticker.url.length, replyToMessageId: args.replyToMessageId ?? null }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
           // #endregion
@@ -318,10 +319,14 @@ export function buildToolDefs() {
       },
       async execute(ctx, args) {
         try {
-          const sticker = await ctx.stickers.findForSend(args.stickerId);
+          // 看图不应该有副作用：用 find（同步/刷新地址）而不是 findForSend
+          // （后者会把抓不到的条目标记成失效）。
+          const sticker = await ctx.stickers.find(args.stickerId);
           if (!sticker) return err(`找不到表情 ${args.stickerId}`);
-          if (!sticker.url) return err('该表情没有图片地址');
-          const prepared = await downloadImageAsDataUrls(sticker.url, ctx.signal, { split: false });
+          const image = ctx.stickers.readImage(sticker.id);
+          const source = image ? `base64://${image.buffer.toString('base64')}` : sticker.url;
+          if (!source) return err('该表情没有图片地址');
+          const prepared = await downloadImageAsDataUrls(source, ctx.signal, { split: false });
           return { content: imageParts(`表情 ${sticker.id}（备注：${sticker.desc || '无'}）：`, prepared.dataUrls.slice(0, 1)) };
         } catch (error) {
           return err(error?.message ?? error);
@@ -368,7 +373,7 @@ export function buildToolDefs() {
           if (!entry) return err(`在当前会话找不到消息 ${args.messageId}。${midHint(ctx)}`);
           const imageMedia = (entry.media || []).find((m) => m.kind === 'image' && m.url);
           if (!imageMedia) return err('该消息没有可收藏的图片');
-          const saved = ctx.stickers.collect(args.messageId, { url: imageMedia.url, note: String(args.note ?? '') });
+          const saved = await ctx.stickers.collect(args.messageId, { url: imageMedia.url, note: String(args.note ?? ''), signal: ctx.signal });
           return ok({ collected: true, id: saved.id, note: saved.localNote });
         } catch (error) {
           return err(error?.message ?? error);

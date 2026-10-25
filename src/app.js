@@ -2212,8 +2212,20 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
         }
         if (sticker?.source === 'ai') {
           sticker = await stickers.findForSend(id);
+          // findForSend 可能已经把它本地化：优先读本地副本，base64:// 不能走 safeFetchBinary。
+          const localized = stickers.readImage(id);
+          if (localized) {
+            res.writeHead(200, {
+              'content-type': localized.contentType,
+              'content-length': localized.buffer.length,
+              'cache-control': 'private, max-age=300',
+              'x-content-type-options': 'nosniff'
+            });
+            res.end(localized.buffer);
+            return;
+          }
         }
-        if (!sticker?.url) return json(res, 404, { error: '表情图片不存在' });
+        if (!sticker?.url) return json(res, 404, { error: '表情图片不存在或已失效' });
         try {
           const image = await safeFetchBinary(sticker.url, 8 * 1024 * 1024);
           const contentType = String(image.contentType || '').split(';')[0].trim().toLowerCase();

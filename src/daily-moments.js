@@ -1339,6 +1339,18 @@ export class DailyMomentsManager {
     if (candidate.prepared) return candidate.prepared;
     const source = await this.#resolveImageSource(snapshot, imageId);
     if (!source) return null;
+    // 表情本地化后返回的是 base64://，不需要（也不能）走 URL 校验和下载。
+    if (source.startsWith('base64://')) {
+      const localBuffer = Buffer.from(source.slice('base64://'.length), 'base64');
+      if (!localBuffer.length) throw new Error(`候选图片 ${imageId} 内容为空`);
+      const mime = imageMime(localBuffer, '');
+      const encoded = localBuffer.toString('base64');
+      candidate.prepared = {
+        dataUrl: `data:${mime};base64,${encoded}`,
+        uploadSource: `base64://${encoded}`
+      };
+      return candidate.prepared;
+    }
     const safeUrl = await this.validateImage(source);
     const { buffer, contentType } = await this.fetchBinary(
       safeUrl,
