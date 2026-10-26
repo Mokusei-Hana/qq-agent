@@ -321,6 +321,9 @@ async function customSearchRequest(query, providerId, signal) {
   if (type === 'bing') {
     return bingSearchWithUrl(query, String(cfg.baseUrl || ''));
   }
+  if (type === 'exa') {
+    return exaSearchRequest(query, cfg, signal);
+  }
 
   const endpoint = String(cfg.baseUrl || '').replace(/\/+$/, '');
   if (!endpoint) throw new Error('自定义搜索未配置接口地址（设置 → 模型 API → 搜索提供方 → 自定义）');
@@ -369,6 +372,95 @@ async function customSearchRequest(query, providerId, signal) {
     .slice(0, Math.max(1, Number(getConfig().webSearch?.maxResults) || 6));
   if (!results.length) {
     throw new Error('自定义搜索没有返回可识别的结果（请检查接口返回是否包含 results/data/sources 等数组，或改用 bing 类型抓页面）');
+  }
+  return { query, results };
+}
+
+/**
+ * 只保留可用的 HTTP/HTTPS 网页链接（Exa 偶尔会给 mailto: / javascript: 之类）。
+ */
+function httpUrlOnly(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.toString() : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 自定义搜索的 exa 类型：Exa Search API（https://api.exa.ai/search）。
+ *
+ * 官方文档要点（2026-10 版本）：
+ *   - 认证头是 `x-api-key`，不是 `Authorization: Bearer`
+ *   - `type: "auto"` 是官方推荐的均衡模式
+ *   - `contents.highlights` 推荐直接传 `true`（Exa 自行决定每页返回多少），
+ *     需要固定预算时才是对象 `{ maxCharacters }`
+ *   - 结果在 `results[]`，每条含 title / url / highlights[]
+ */
+async function exaSearchRequest(query, cfg, signal) {
+  // webSearch() 已清洗过一次；这里再清一次是幂等的，
+  // 但能兜住 /api/search-providers/test 之类的直接调用。
+  const clean = sanitizeQuery(query);
+  if (!clean) throw new Error('Exa 搜索的查询词为空');
+  const apiKey = String(cfg.apiKey || process.env.EXA_API_KEY || '').trim();
+  if (!apiKey) throw new Error('Exa 搜索需要 API Key（设置 → 搜索服务 → 添加自定义搜索服务，或环境变量 EXA_API_KEY）');
+  const endpoint = String(cfg.baseUrl || 'https://api.exa.ai/search').trim();
+  // 请求条数：默认 6，最多 10（Exa 支持到 100，但这里受 QQ-Agent 展示预算限制）
+  const numResults = Math.min(10, Math.max(1, Number(cfg.count) || 6));
+
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey
+    },
+    body: JSON.stringify({
+      query: clean,
+      type: 'auto',
+      numResults,
+      contents: { highlights: true }
+    }),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(Math.max(5000, Number(cfg.timeoutMs) || 20000))])
+  });
+  if (!res.ok) {
+    // 不把 Key 写进错误文本；只回显状态码与服务端说明
+    const text = await res.text().catch(() => '');
+    throw new Error(`Exa 搜索 HTTP ${res.status}：${text.slice(0, 300)}`);
+  }
+  const data = await res.json().catch(() => { throw new Error('Exa 搜索返回了无法解析的 JSON'); });
+  if (!Array.isArray(data?.results)) {
+    throw new Error('Exa 搜索返回结构异常（缺少 results 数组）');
+  }
+
+  const limit = Math.max(1, Math.min(10, Number(getConfig().webSearch?.maxResults) || 6));
+  const results = data.results
+    .map((r) => {
+      const url = httpUrlOnly(r?.url);
+      if (!url) return null;
+      const highlights = Array.isArray(r?.highlights)
+        // 官方只会给字符串；非字符串（null/数字/对象）一律丢弃，避免 ["[object Object]"]
+        ? r.highlights.filter((h) => typeof h === 'string').map((h) => h.trim()).filter(Boolean)
+        : [];
+      // 摘要优先级：highlights（官方推荐的问答片段）→ summary → text 截断
+      const snippet = (
+        highlights.join(' … ').trim()
+        || String(r?.summary ?? '').trim()
+        || String(r?.text ?? '').trim()
+      ).slice(0, 2000);
+      return {
+        title: String(r?.title ?? '').trim() || '（无标题）',
+        url,
+        snippet
+      };
+    })
+    .filter(Boolean)
+    .slice(0, limit);
+
+  if (!results.length) {
+    throw new Error('Exa 搜索没有返回有效结果（请检查 API Key、配额，或接口地址是否为 https://api.exa.ai/search）');
   }
   return { query, results };
 }

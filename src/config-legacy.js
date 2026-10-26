@@ -93,16 +93,17 @@ export const DEFAULT_CONFIG = {
     },
     // 自定义搜索提供商列表（设置页可像添加模型提供商一样自行添加，可多个）。
     // 每项：{ id, name, type, baseUrl, apiKey, model, count, timeoutMs }
-    // type: 'openai' = POST JSON 搜索接口；'bing' = GET 页面并按 b_algo 解析
+    // type: 'openai' = POST JSON 搜索接口；'bing' = GET 页面并按 b_algo 解析；
+    //       'exa' = Exa Search API（认证头是 x-api-key，不是 Bearer）
     // 在「搜索提供方」下拉框里以 custom:<id> 的形式出现
     providers: [],
     // 自定义搜索服务（旧的单槽位，保留以兼容；新添加的建议用上面的 providers 数组）
     custom: {
       name: '',                       // 展示名，如"我的 SearXNG"
-      type: 'openai',                 // 'openai' = OpenAI 风格的 JSON 搜索 API；'bing' = 抓 HTML 解析 b_algo
-      baseUrl: '',                    // openai: 搜索端点；bing: 搜索页地址
-      apiKey: '',                     // openai 类型需要（可选，视服务而定）
-      model: '',                      // openai 类型可选： Responses API 风格的模型名
+      type: 'openai',                 // 'openai' JSON 搜索 API | 'bing' 抓 HTML 解析 b_algo | 'exa' Exa Search API
+      baseUrl: '',                    // openai: 搜索端点；bing: 搜索页地址；exa: 默认 https://api.exa.ai/search
+      apiKey: '',                     // openai / exa 类型需要（exa 也可用环境变量 EXA_API_KEY）
+      model: '',                      // openai 类型可选： Responses API 风格的模型名（exa 留空）
       count: 6,
       timeoutMs: 20000
     }

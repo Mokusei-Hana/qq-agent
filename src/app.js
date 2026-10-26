@@ -1676,7 +1676,9 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
         try {
           const body = await readBody(req).catch(() => ({}));
           const baseUrl = String(body.baseUrl ?? '').trim();
-          const type = String(body.type ?? 'openai').trim() === 'bing' ? 'bing' : 'openai';
+          // 只接受已知类型，其余一律回落 openai（避免脏值写进配置）
+          const rawType = String(body.type ?? 'openai').trim().toLowerCase();
+          const type = rawType === 'bing' || rawType === 'exa' ? rawType : 'openai';
           if (!baseUrl) return json(res, 400, { ok: false, error: '接口地址不能为空' });
           const list = [...(getConfig().webSearch?.providers || [])];
           const existing = list.find((p) => p.baseUrl === baseUrl && p.type === type);

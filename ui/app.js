@@ -4652,7 +4652,7 @@ function renderSearchSection(c) {
         <option value="bocha" ${prov === 'bocha' ? 'selected' : ''}>博查 AI Search</option>
         <option value="baidu" ${prov === 'baidu' ? 'selected' : ''}>百度千帆 AI Search</option>
         <option value="metaso" ${prov === 'metaso' ? 'selected' : ''}>秘塔 AI 搜索</option>
-        ${customProvs.map((p) => `<option value="custom:${esc(p.id)}" ${prov === `custom:${p.id}` ? 'selected' : ''}>${esc(p.name || p.baseUrl)}（自定义 · ${p.type === 'bing' ? '网页解析' : 'JSON 接口'}）</option>`).join('')}
+        ${customProvs.map((p) => `<option value="custom:${esc(p.id)}" ${prov === `custom:${p.id}` ? 'selected' : ''}>${esc(p.name || p.baseUrl)}（自定义 · ${p.type === 'bing' ? '网页解析' : p.type === 'exa' ? 'Exa' : 'JSON 接口'}）</option>`).join('')}
       </select></div>
     <div class="field" id="custom-provider-manage" style="${prov.startsWith('custom:') ? '' : 'display:none'}">
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -4711,12 +4711,14 @@ function renderSearchSection(c) {
         <select id="new-sp-type">
           <option value="openai">JSON 搜索接口（POST）</option>
           <option value="bing">网页解析（Bing 结果格式）</option>
+          <option value="exa">Exa 搜索（api.exa.ai）</option>
         </select></div>
     </div>
     <div class="field"><label>接口地址 / 搜索页地址</label>
-      <input type="text" id="new-sp-baseurl" placeholder="JSON 类型：https://your-search.example.com/search；网页类型：https://your-searx.example.com/search" style="width:100%" /></div>
+      <input type="text" id="new-sp-baseurl" placeholder="JSON 类型：https://your-search.example.com/search；网页类型：https://your-searx.example.com/search；Exa：https://api.exa.ai/search" style="width:100%" /></div>
+    <div class="hint" id="new-sp-type-hint"></div>
     <div class="field-row">
-      <div class="field"><label>API Key（可选）</label>
+      <div class="field"><label id="new-sp-apikey-label">API Key（可选）</label>
         <input type="password" id="new-sp-apikey" placeholder="多数自建服务留空即可" autocomplete="new-password" style="width:100%" /></div>
       <div class="field"><label>模型名（可选）</label>
         <input type="text" id="new-sp-model" placeholder="Responses API 风格才需要" /></div>
@@ -6908,6 +6910,39 @@ function bindSettingsEvents(c) {
   });
 
   // ── 自定义搜索服务：添加 / 测试 / 删除 ──
+  // 类型切换时给出对应默认地址提示（Exa 直接填官方端点，省得用户记）
+  const EXA_ENDPOINT = 'https://api.exa.ai/search';
+  let autoFilledBaseUrl = '';
+  const syncSearchTypeHint = () => {
+    const type = $('#new-sp-type')?.value || 'openai';
+    const hint = $('#new-sp-type-hint');
+    const baseInput = $('#new-sp-baseurl');
+    const keyInput = $('#new-sp-apikey');
+    const keyLabel = $('#new-sp-apikey-label');
+    if (type === 'exa') {
+      if (hint) hint.textContent = 'Exa：接口地址填 https://api.exa.ai/search，API Key 用 Exa 控制台生成的密钥（认证头为 x-api-key），模型名留空。';
+      // 只在用户没自己填过的时候预填，且记下来，切走时清掉，避免把 Exa 地址留念到别的类型
+      if (baseInput && !baseInput.value.trim()) {
+        baseInput.value = EXA_ENDPOINT;
+        autoFilledBaseUrl = EXA_ENDPOINT;
+      }
+      if (baseInput) baseInput.placeholder = EXA_ENDPOINT;
+      if (keyInput) keyInput.placeholder = 'Exa API Key（必填）';
+      if (keyLabel) keyLabel.textContent = 'API Key（Exa 必填）';
+    } else {
+      if (hint) hint.textContent = '';
+      // 只回收我们自动填进去的值，用户手填的不动
+      if (baseInput && autoFilledBaseUrl && baseInput.value.trim() === autoFilledBaseUrl) {
+        baseInput.value = '';
+      }
+      autoFilledBaseUrl = '';
+      if (baseInput) baseInput.placeholder = 'JSON 类型：https://your-search.example.com/search；网页类型：https://your-searx.example.com/search';
+      if (keyInput) keyInput.placeholder = '多数自建服务留空即可';
+      if (keyLabel) keyLabel.textContent = 'API Key（可选）';
+    }
+  };
+  $('#new-sp-type')?.addEventListener('change', syncSearchTypeHint);
+
   $('#add-search-provider-btn')?.addEventListener('click', async () => {
     const hint = $('#add-search-provider-hint');
     const baseUrl = ($('#new-sp-baseurl')?.value || '').trim();
