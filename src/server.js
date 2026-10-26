@@ -2,6 +2,10 @@
 import { createApp } from './app.js';
 import { installManualFriendReviewRoute } from './manual-friend-review-route.js';
 import { installExperimentalMultimodalContextPilot } from './experimental-multimodal-context.js';
+import { installNetworkCompat } from './network-compat.js';
+
+// 出站连接兼容：修正无 IPv6 路由机器上的 Happy Eyeballs 过度回退（见 network-compat.js）。
+installNetworkCompat();
 
 let app = null;
 process.on('unhandledRejection', (error) => {
