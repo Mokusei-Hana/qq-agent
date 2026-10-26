@@ -222,6 +222,7 @@ export class MemeLearningManager {
           else this.stats.rejected += 1;
         }
       }
+      await this.#processGroupCandidates(now);
       this.expireOldEntries(now);
       this.lastRunAt = now;
       return this.status();
@@ -230,6 +231,70 @@ export class MemeLearningManager {
       throw error;
     } finally {
       this.running = false;
+    }
+  }
+
+  async #processGroupCandidates(now) {
+    const db = this.#db();
+    const rows = db.prepare(`
+      SELECT phrase, group_id, occurrences FROM meme_candidates
+      WHERE status = 'queued'
+      ORDER BY occurrences DESC, last_seen_at DESC LIMIT 10
+    `).all();
+    for (const candidate of rows) {
+      try {
+        const response = await this.deps.searchWeb(`“${candidate.phrase}” 网络梗 含义 用法`);
+        const sources = [];
+        for (const item of (Array.isArray(response?.results) ? response.results : []).slice(0, 10)) {
+          const url = cleanText(item?.url, 2000);
+          const domain = sourceDomain(url);
+          if (!domain || sources.some((source) => source.url === url)) continue;
+          let excerpt = cleanText(item?.snippet, 1200);
+          if (typeof this.deps.fetchSource === 'function') {
+            try {
+              const page = await this.deps.fetchSource(url);
+              excerpt = cleanText(page?.text || page?.content || excerpt, 3000);
+            } catch { /* Search snippets are retained as fallback evidence. */ }
+          }
+          if (excerpt.length >= 20) sources.push({
+            url, domain, title: cleanText(item?.title, 300), excerpt
+          });
+        }
+        const analysis = await this.deps.analyze({
+          query: candidate.phrase,
+          candidatePhrase: candidate.phrase,
+          sourceType: 'qq-group-candidate',
+          groupId: candidate.group_id,
+          occurrences: Number(candidate.occurrences) || 1,
+          sources
+        });
+        const term = cleanText(analysis?.term || candidate.phrase, 100);
+        const meaning = cleanText(analysis?.meaning, 1000);
+        const domains = new Set(sources.map((source) => source.domain));
+        const confidence = clamp(analysis?.confidence, 0, 1, 0);
+        const verified = analysis?.verified === true
+          && analysis?.sensitive !== true
+          && Boolean(meaning)
+          && domains.size >= clamp(this.config.minDomains, 2, 5, DEFAULTS.minDomains)
+          && confidence >= clamp(this.config.minConfidence, 0.5, 0.99, DEFAULTS.minConfidence);
+        if (meaning && analysis?.sensitive !== true) {
+          this.#saveProposal({
+            analysis: { ...analysis, term, meaning, confidence },
+            sources,
+            admitted: verified,
+            now
+          });
+        }
+        db.prepare("UPDATE meme_candidates SET status = ? WHERE phrase = ? AND group_id = ?")
+          .run(verified ? 'researched' : 'needs_review', candidate.phrase, candidate.group_id);
+        this.stats.researched += 1;
+        if (verified) this.stats.admitted += 1;
+        else this.stats.rejected += 1;
+      } catch (error) {
+        db.prepare("UPDATE meme_candidates SET status = 'queued' WHERE phrase = ? AND group_id = ?")
+          .run(candidate.phrase, candidate.group_id);
+        this.lastError = String(error?.message ?? error);
+      }
     }
   }
 
