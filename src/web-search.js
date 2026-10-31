@@ -29,7 +29,7 @@ function decodeHtml(s) {
 }
 
 /** Bing 搜索（解析 b_algo 结果块）。searchUrl 可在配置中替换（测试/换引擎）。 */
-export async function bingSearch(query) {
+export async function bingSearch(query, { signal: parentSignal } = {}) {
   const cfg = getConfig().webSearch ?? {};
   const searchUrl = String(cfg.searchUrl || 'https://cn.bing.com/search');
   const maxResults = Math.max(1, Math.min(10, Number(cfg.maxResults) || 6));
@@ -40,7 +40,7 @@ export async function bingSearch(query) {
       'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
       'accept-language': 'zh-CN,zh;q=0.9'
     },
-    signal: AbortSignal.timeout(15000)
+    signal: AbortSignal.any([...(parentSignal ? [parentSignal] : []), AbortSignal.timeout(15000)])
   });
   if (!res.ok) throw new Error(`搜索服务 HTTP ${res.status}`);
   const html = await res.text();
@@ -61,22 +61,23 @@ export async function bingSearch(query) {
 }
 
 /** 给工具用的统一入口：搜索 + 紧凑序列化。 */
-export async function webSearch(query) {
+export async function webSearch(query, { signal: parentSignal } = {}) {
   assertTimeAllowed();
+  parentSignal?.throwIfAborted();
   const clean = sanitizeQuery(query);
   if (!clean) throw new Error('查询词为空');
   const cfg = getConfig().webSearch ?? {};
   const provider = String(cfg.provider || 'bing').toLowerCase();
-  if (provider === 'deepseek') return deepSeekSearch(clean);
-  if (provider === 'zhipu') return zhipuSearch(clean);
-  if (provider === 'bocha') return bochaSearch(clean);
-  if (provider === 'baidu') return baiduSearch(clean);
-  if (provider === 'metaso') return metasoSearch(clean);
+  if (provider === 'deepseek') return deepSeekSearch(clean, { signal: parentSignal });
+  if (provider === 'zhipu') return zhipuSearch(clean, { signal: parentSignal });
+  if (provider === 'bocha') return bochaSearch(clean, { signal: parentSignal });
+  if (provider === 'baidu') return baiduSearch(clean, { signal: parentSignal });
+  if (provider === 'metaso') return metasoSearch(clean, { signal: parentSignal });
   // 自定义：'custom'（旧单槽位）或 'custom:<id>'（设置页添加的多个之一）
   if (provider === 'custom' || provider.startsWith('custom:')) {
-    return customSearch(clean, provider);
+    return customSearch(clean, provider, { signal: parentSignal });
   }
-  return bingSearch(clean);
+  return bingSearch(clean, { signal: parentSignal });
 }
 
 /**
@@ -86,8 +87,8 @@ export async function webSearch(query) {
  * 搜索结果生成的最终回答；URL/标题/摘要为黑盒，拿不到结构化来源。适合
  * “只要能搜到并总结”的场景；需要引用列表时请用 Bing / 其他搜索 API。
  */
-export function deepSeekSearch(query) {
-  return withTimeWindow((signal) => deepSeekSearchRequest(query, signal));
+export function deepSeekSearch(query, { signal: parentSignal } = {}) {
+  return withTimeWindow((signal) => deepSeekSearchRequest(query, signal), parentSignal);
 }
 
 async function deepSeekSearchRequest(query, signal) {
@@ -134,7 +135,7 @@ export async function webFetch(url) {
 }
 
 /** 智谱 Web Search API（结构化结果：标题/链接/摘要/网站名/日期）。 */
-export async function zhipuSearch(query) {
+export async function zhipuSearch(query, { signal: parentSignal } = {}) {
   const cfg = getConfig().webSearch?.zhipu ?? {};
   const apiKey = String(cfg.apiKey || process.env.ZHIPU_API_KEY || '').trim();
   if (!apiKey) throw new Error('智谱搜索需要 API Key（设置里填，或环境变量 ZHIPU_API_KEY）');
@@ -149,7 +150,7 @@ export async function zhipuSearch(query) {
       authorization: `Bearer ${apiKey}`
     },
     body: JSON.stringify({ search_engine: engine, search_query: query, count }),
-    signal: AbortSignal.timeout(Math.max(10000, Number(cfg.timeoutMs) || 20000))
+    signal: AbortSignal.any([...(parentSignal ? [parentSignal] : []), AbortSignal.timeout(Math.max(10000, Number(cfg.timeoutMs) || 20000))])
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -170,7 +171,7 @@ export async function zhipuSearch(query) {
 }
 
 /** 博查 Web Search API（国内中文优化，网页结果在 data.webPages.value）。 */
-export async function bochaSearch(query) {
+export async function bochaSearch(query, { signal: parentSignal } = {}) {
   const cfg = getConfig().webSearch?.bocha ?? {};
   const apiKey = String(cfg.apiKey || process.env.BOCHA_API_KEY || '').trim();
   if (!apiKey) throw new Error('博查搜索需要 API Key（设置里填，或环境变量 BOCHA_API_KEY）');
@@ -184,7 +185,7 @@ export async function bochaSearch(query) {
       authorization: `Bearer ${apiKey}`
     },
     body: JSON.stringify({ query, count, freshness: 'noLimit', summary: false }),
-    signal: AbortSignal.timeout(Math.max(10000, Number(cfg.timeoutMs) || 20000))
+    signal: AbortSignal.any([...(parentSignal ? [parentSignal] : []), AbortSignal.timeout(Math.max(10000, Number(cfg.timeoutMs) || 20000))])
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -208,7 +209,7 @@ export async function bochaSearch(query) {
 }
 
 /** 百度千帆 AI Search（web_search，返回 references）。 */
-export async function baiduSearch(query) {
+export async function baiduSearch(query, { signal: parentSignal } = {}) {
   const cfg = getConfig().webSearch?.baidu ?? {};
   const apiKey = String(cfg.apiKey || process.env.BAIDU_SEARCH_API_KEY || '').trim();
   if (!apiKey) throw new Error('百度搜索需要 API Key（设置里填，或环境变量 BAIDU_SEARCH_API_KEY）');
@@ -226,7 +227,7 @@ export async function baiduSearch(query) {
       search_source: 'baidu_search_v2',
       resource_type_filter: [{ type: 'web', top_k: topK }]
     }),
-    signal: AbortSignal.timeout(Math.max(10000, Number(cfg.timeoutMs) || 20000))
+    signal: AbortSignal.any([...(parentSignal ? [parentSignal] : []), AbortSignal.timeout(Math.max(10000, Number(cfg.timeoutMs) || 20000))])
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -250,7 +251,7 @@ export async function baiduSearch(query) {
 }
 
 /** 秘塔 AI 搜索（metaso.cn，每天 100 次免费）。 */
-export async function metasoSearch(query) {
+export async function metasoSearch(query, { signal: parentSignal } = {}) {
   const cfg = getConfig().webSearch?.metaso ?? {};
   const apiKey = String(cfg.apiKey || process.env.METASO_API_KEY || '').trim();
   const endpoint = String(cfg.baseUrl || 'https://metaso.cn/api/open/v1/search').replace(/\/+$/, '');
@@ -262,7 +263,7 @@ export async function metasoSearch(query) {
       ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {})
     },
     body: JSON.stringify({ query, top_k: Math.min(10, Math.max(1, Number(cfg.count) || 6)) }),
-    signal: AbortSignal.timeout(Math.max(10000, Number(cfg.timeoutMs) || 20000))
+    signal: AbortSignal.any([...(parentSignal ? [parentSignal] : []), AbortSignal.timeout(Math.max(10000, Number(cfg.timeoutMs) || 20000))])
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -310,8 +311,8 @@ function resolveCustomConfig(providerId = null) {
  *     适合 SearXNG、Tavily、自建聚合搜索等。
  *   - 'bing'：GET 一个搜索页并用 b_algo 块解析（兼容 Bing 结果格式的引擎，如部分 SearXNG 实例）。
  */
-export function customSearch(query, providerId = null) {
-  return withTimeWindow((signal) => customSearchRequest(query, providerId, signal));
+export function customSearch(query, providerId = null, { signal: parentSignal } = {}) {
+  return withTimeWindow((signal) => customSearchRequest(query, providerId, signal), parentSignal);
 }
 
 async function customSearchRequest(query, providerId, signal) {
@@ -319,7 +320,7 @@ async function customSearchRequest(query, providerId, signal) {
   const type = String(cfg.type || 'openai').toLowerCase();
 
   if (type === 'bing') {
-    return bingSearchWithUrl(query, String(cfg.baseUrl || ''));
+    return bingSearchWithUrl(query, String(cfg.baseUrl || ''), signal);
   }
   if (type === 'exa') {
     return exaSearchRequest(query, cfg, signal);
@@ -466,7 +467,7 @@ async function exaSearchRequest(query, cfg, signal) {
 }
 
 /** 用指定 URL 跑一次 Bing 结果的 HTML 解析（供自定义 bing 类型复用）。 */
-async function bingSearchWithUrl(query, searchUrl) {
+async function bingSearchWithUrl(query, searchUrl, parentSignal) {
   const cfg = getConfig().webSearch ?? {};
   const url = String(searchUrl || cfg.searchUrl || 'https://cn.bing.com/search');
   const maxResults = Math.max(1, Math.min(10, Number(cfg.maxResults) || 6));
@@ -477,7 +478,7 @@ async function bingSearchWithUrl(query, searchUrl) {
       'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
       'accept-language': 'zh-CN,zh;q=0.9'
     },
-    signal: AbortSignal.timeout(15000)
+    signal: AbortSignal.any([...(parentSignal ? [parentSignal] : []), AbortSignal.timeout(15000)])
   });
   if (!res.ok) throw new Error(`自定义搜索（bing 类型）HTTP ${res.status}`);
   const html = await res.text();

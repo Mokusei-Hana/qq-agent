@@ -11,6 +11,7 @@ export const EXPERIMENTAL_READ_ONLY_TOOLS = new Set([
   'get_message_detail',
   'get_active_members',
   'memory_query',
+  'slang_query',
   'person_memory_lookup',
   'web_search',
   'web_fetch'
@@ -39,6 +40,9 @@ export const EXPERIMENTAL_SAME_ROUND_ACTION_TOOLS = new Set([
   'send_poke',
   'memory_append',
   'memory_remove',
+  'slang_submit',
+  'slang_feedback',
+  'slang_review',
   'collect_sticker',
   'sticker_note',
   'report_feedback',

@@ -23,7 +23,10 @@ import { currentProviders, setProviderKey, testAllProviders, testOneProvider, te
 import { scanModelsVision, visionResults, modelImageVerdict } from './vision-scan.js';
 import { builtinVisionResults } from './model-vision-docs.js';
 import { createEventBus, todayKey, shanghaiDayStart } from './util.js';
-import { assertCanSend } from './access.js';
+import { assertCanSend, chatAllowed, canRun } from './access.js';
+import { SlangLearning, slangLearningSettings } from './slang-learning.js';
+import { extractSlang, researchSlang } from './slang-learning-research.js';
+import { BridgeReceiptGuard } from './return-context.js';
 import { isTimeActive } from './time-gate.js';
 import { timeControlState, TIME_ZONE } from './time-control.js';
 import { IdentityPilotManager, inactiveIdentityPilotStatus } from './identity-pilot.js';
@@ -240,7 +243,14 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
   });
   let identityPilot = null;
   let identityPilotError = '';
+  const bridgeReceipts = new BridgeReceiptGuard(path.join(DATA_DIR,'bridge-receipts.sqlite'));
+  const slangLearning = new SlangLearning({
+    dataDir: DATA_DIR, config: getConfig, allowed: (chat) => chatAllowed(chat),
+    canWork: (chat) => chat ? canRun(chat) : getConfig().runtime?.mode === 'active' && !getConfig().runtime?.paused && isTimeActive(),
+    extract: extractSlang, research: researchSlang
+  });
   const orchestrator = new Orchestrator({
+    getSlangLearning: () => slangLearning,
     store,
     memory,
     stickers,
@@ -615,6 +625,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     // 屏蔽名单：被屏蔽群员的消息直接丢弃 —— 不存档、不触发会话、不进提示词背景。
     // 放在最前面：连合并转发展开这种网络请求都不值得为它做。
     if (kind === 'group' && senderId && (cfgNow.blocklist?.[id] || []).map(String).includes(senderId)) return;
+    if (bridgeReceipts.has(onebot.selfId, chatKey, event.message_id)) return;
     const media = segments ? extractMediaFromSegments(segments) : [];
     const mentionsSelf = Boolean(segments?.some((segment) =>
       segment?.type === 'at'
@@ -697,6 +708,10 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
       )
     ) return;
     if (!isSelf) orchestrator.onIncoming(chatKey);
+    if (!isSelf) {
+      try { slangLearning.observe(chatKey, stored); }
+      catch { log('[slang-learning] 采集失败；实时聊天继续'); }
+    }
   }
 
   async function handleFriendProposalAdminCommand(kind, id, text) {
@@ -1095,6 +1110,36 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
       if (!authorize(req)) return json(res, 401, { error: '未授权' });
       const method = req.method;
       const cfgNow = getConfig();
+
+      if (pathname.startsWith('/api/slang-learning/')) {
+        try {
+          const action = pathname.slice('/api/slang-learning/'.length);
+          if (method === 'GET' && action === 'status') return json(res, 200, slangLearning.status());
+          if (method === 'GET' && action === 'discoveries') return json(res, 200, slangLearning.store.list({ status: url.searchParams.get('status') || '', limit: Number(url.searchParams.get('limit')) || 100 }));
+          if (method === 'GET' && action === 'feedback') {
+            const rows = fs.existsSync(slangLearning.store.file) ? slangLearning.store.open().prepare("SELECT * FROM audit WHERE action='feedback' ORDER BY seq DESC LIMIT 100").all() : [];
+            return json(res, 200, rows.map(r => ({ ...r, details: JSON.parse(r.details) })));
+          }
+          if (method === 'POST') {
+            const body = await readBody(req);
+            const actor = cfgNow.admin?.ownerUin;
+            slangLearning.assertAdmin(actor);
+            if (action === 'settings') {
+              const previous = slangLearning.settings();
+              const settings = slangLearningSettings({ ...previous, ...body });
+              if (body.graduated === true && !previous.graduated && body.confirm !== true) throw Error('固化需要明确确认');
+              if (settings.enabled && !settings.groups.length) throw Error('启用前必须在独立页面指定授权群');
+              updateConfig({ slangLearning: settings });
+              await slangLearning.sync();
+              return json(res, 200, slangLearning.status());
+            }
+            if (body.confirm !== true) throw Error('该操作需要明确确认');
+            if (action === 'review') return json(res, 200, slangLearning.review(body.id, body.decision, actor));
+            if (action === 'withdraw') return json(res, 200, slangLearning.withdraw(body.chat, body.id, actor));
+          }
+          return json(res, 404, { error: '未知黑话学习接口' });
+        } catch { return json(res, 400, { error: '黑话学习操作失败，请检查权限、授权群与词条状态' }); }
+      }
 
       if (pathname === '/api/console-token' && method === 'POST') {
         const body = await readBody(req);
@@ -1790,6 +1835,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
         const previousIdentityPilot = JSON.stringify(cfgNow.identityPilot || {});
         const previousPersona = JSON.stringify(cfgNow.persona || {});
         const previousSlangPilot = JSON.stringify(cfgNow.slangPilot || {});
+        const previousSlangLearning = JSON.stringify(cfgNow.slangLearning || {});
         const previousIncidentPilot = JSON.stringify(cfgNow.incidentPilot || {});
         const previousIdentitySources = JSON.stringify({
           allow: cfgNow.allow || {},
@@ -1882,6 +1928,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
           }
         }
         initPriceFeed(next.api?.priceRemoteUrl || '');   // 远程价格表 URL 可能改了（内部幂等）
+        if (JSON.stringify(next.slangLearning || {}) !== previousSlangLearning) await slangLearning.sync();
         emit('status', { configUpdated: true });
         return json(res, 200, { ok: true, config: sanitizeConfig(next) });
       }
@@ -2918,6 +2965,8 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     }
     refreshTimeControl();
     orchestrator.startRecoveryLoop();
+    try { await slangLearning.sync(); }
+    catch { log('[slang-learning] 后台模块启动失败；聊天主流程继续'); }
     if (getConfig().dailyMoments?.enabled) dailyMoments.start();
     if (getConfig().qzoneInteractions?.enabled) qzoneInteractions.start();
     if (getConfig().proactive?.enabled) orchestrator.startProactiveLoop();
@@ -2938,6 +2987,8 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     autoUpdate.stop();
     identityPilot?.stop();
     identityPilot = null;
+    await slangLearning.stop();
+    bridgeReceipts.close();
     await slangPilot?.stop();
     slangPilot = null;
     await incidentPilot?.stop();
