@@ -625,6 +625,7 @@ export function buildUserPrompt(ctx) {
   if (!lifecycleContinuation && ctx.slangContext) {
     parts.push(String(ctx.slangContext));
   }
+  if (ctx.personalityContext) parts.push(String(ctx.personalityContext));
   if (ctx.incidentContext) {
     parts.push(String(ctx.incidentContext));
   }

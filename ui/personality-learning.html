@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>人格自我迭代 · QQ Agent</title><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/personality-learning.css"></head>
+<body><main><a href="/">← 返回控制台</a><header><div><p>QQ AGENT / PERSONALITY</p><h1>人格自我迭代</h1><p>观察表达，积累证据，逐步改进。核心人设、安全与权限由人工维护。</p></div><button id="refresh">刷新</button></header>
+<p id="error" role="alert" hidden></p><p id="status" role="status">正在连接…</p>
+<section><h2>学习设置</h2><form id="settings">
+<label>授权群号（逗号分隔）<input id="groups" autocomplete="off"></label>
+<label>运行模式<select id="mode"><option value="observe">观察：只统计，不改变回复</option><option value="dynamic">动态：允许使用已验证的偏好</option></select></label>
+<label><input type="checkbox" id="enabled">启用人格学习</label>
+<label><input type="checkbox" id="injectEnabled">注入已激活的动态偏好</label>
+<label><input type="checkbox" id="autoApply">自动应用满足阈值的低风险偏好</label>
+<div class="fields"><label>最低证据数<input id="minEvidence" type="number" min="10" max="1000"></label><label>最低置信度<input id="minConfidence" type="number" min="0.8" max="1" step="0.01"></label><label>最小观察天数<input id="minWindowDays" type="number" min="3" max="30"></label><label>最少不同互动对象<input id="minSources" type="number" min="2" max="30"></label><label>观察保留天数<input id="retentionDays" type="number" min="7" max="90"></label></div>
+<p>初期保持观察模式。停用后保留全部数据；本页仅保存人格学习设置。</p><button type="submit">保存设置</button></form>
+<div class="actions"><button id="analyze">生成统计与候选</button><button id="cleanup">清理到期观察</button></div></section>
+<section><h2>近期表达统计</h2><p>只保存固定标签、哈希和统计值，不保存回复原文。统计不是语义或事实正确性的自动判断。</p><div id="stats"></div></section>
+<section><h2>候选与生效习惯</h2><p>证据数量、不同来源、置信度和观察窗口全部达标后才允许激活。群级规则默认不跨群。</p><div id="habits"></div></section>
+<section><h2>版本与成长日志</h2><p>版本差异只包含动态表达偏好。回滚不会覆盖群聊记忆、黑话库或核心人格。</p><div id="versions"></div></section>
+<section><h2>人工评价与弱反馈</h2><p>弱反馈单独记录，不把回复或点赞等同于质量。反馈不能直接修改规则。</p>
+<form id="feedback"><div class="fields"><label>群号<input id="feedback-group" required></label><label>已观察回复 ID<input id="feedback-response" required maxlength="100"></label><label>评价维度<select id="feedback-type"><option value="relevance">相关性</option><option value="naturalness">自然度</option><option value="repetition">句式重复</option><option value="filler">空洞填充</option><option value="emotion">情绪匹配</option><option value="agreement">过度附和</option><option value="interruption">强行接话</option><option value="persona">核心人格符合度</option><option value="weak_reply">弱信号：后续回复</option><option value="weak_like">弱信号：点赞</option></select></label><label>评价<select id="feedback-score"><option value="0">待判断／中性</option><option value="1">正面</option><option value="-1">负面</option></select></label></div><button>记录反馈</button></form><div id="feedback-list"></div></section>
+</main><script src="/personality-learning-page.js"></script></body></html>

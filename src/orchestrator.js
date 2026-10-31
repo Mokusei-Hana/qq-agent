@@ -170,10 +170,12 @@ export class Orchestrator {
     random = Math.random,
     getIdentityPilot = null,
     getIncidentPilot = null,
-    getSlangLearning = () => null
+    getSlangLearning = () => null,
+    getPersonalityLearning = () => null
   }) {
     this.store = store;
     this.getSlangLearning = getSlangLearning;
+    this.getPersonalityLearning = getPersonalityLearning;
     this.memory = memory;
     this.stickers = stickers;
     this.sender = sender;
@@ -274,6 +276,7 @@ export class Orchestrator {
     this.store.recoverExpired();
     this.store.expireConversationThreads?.();
     this.retryTimer = setInterval(() => {
+      try { this.getPersonalityLearning()?.maintenance(); } catch { /* Learning must not block recovery. */ }
       this.store.recoverExpired();
       this.store.expireConversationThreads?.();
       if (this.paused || this.aborted) return;
@@ -806,6 +809,13 @@ export class Orchestrator {
       }
       const status = session.sent.length > 0 ? 'done' : 'noreply';
       this.sessions.finish(session.id, status);
+      if (status === 'noreply') {
+        try {
+          const last = triggerEntries.filter(m => !m.self).at(-1);
+          this.getPersonalityLearning()?.observe({ chatKey, text: '', messageId: 'silence:' + session.id,
+            silence: true, context: last?.text || '', sourceId: last?.senderId || '' });
+        } catch { /* Silence is a valid choice, never a learning failure for chat. */ }
+      }
       this.emit('session-end', { sessionId: session.id, chatKey, status,
         sent: session.sent.length, finishReason: session.finishReason, usage: session.usage });
       if (!manual && !proactive && triggerEntries.length > 0) {
@@ -1114,6 +1124,12 @@ export class Orchestrator {
       identityPilotAvailable: identityAvailable,
       friendProposalAvailable
     });
+    const personalityInput = triggerEntries.map(m => m.text || '').join('\n');
+    let personalityContext = '', personalityFingerprint = '';
+    try {
+      personalityContext = this.getPersonalityLearning()?.preferences(chatKey, personalityInput) || '';
+      personalityFingerprint = this.getPersonalityLearning()?.fingerprint(chatKey, personalityInput) || '';
+    } catch { /* The original prompt remains usable when learning fails. */ }
     const promptPrefixHash = crypto.createHash('sha256')
       .update(String(cfg.api.provider || ''))
       .update('\0')
@@ -1124,6 +1140,7 @@ export class Orchestrator {
       .update(systemPrompt)
       .update('\0')
       .update(JSON.stringify(openAiTools))
+      .update(personalityFingerprint)
       .digest('hex');
 
     let priorProviderMessages = [];
@@ -1174,6 +1191,7 @@ export class Orchestrator {
       memory: this.memory,
       stickerEntries,
       slangContext,
+      personalityContext,
       incidentContext,
       selfNickname,
       selfLastMessageAt,

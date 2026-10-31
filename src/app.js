@@ -25,6 +25,7 @@ import { builtinVisionResults } from './model-vision-docs.js';
 import { createEventBus, todayKey, shanghaiDayStart } from './util.js';
 import { assertCanSend, chatAllowed, canRun } from './access.js';
 import { SlangLearning, slangLearningSettings } from './slang-learning.js';
+import { PersonalityLearning } from './personality-learning.js';
 import { extractSlang, researchSlang } from './slang-learning-research.js';
 import { BridgeReceiptGuard } from './return-context.js';
 import { isTimeActive } from './time-gate.js';
@@ -238,7 +239,15 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
   const stickers = new StickerManager(onebot);
   const sender = new SendQueue({
     onebot, store,
-    onSent: ({ chatKey, text }) => log(`[发送 -> ${chatKey}] ${String(text).slice(0, 60)}`),
+    onSent: (event) => {
+      const { chatKey, text } = event;
+      log(`[发送 -> ${chatKey}] ${String(text).slice(0, 60)}`);
+      try {
+        if (!personalityLearning.active) return;
+        const last = store.recent(chatKey, { limit: 10 }).filter(m => !m.self).at(-1);
+        personalityLearning.observe({ ...event, context: last?.text || '', sourceId: last?.senderId || '' });
+      } catch { log('[personality-learning] 观察失败；已发送结果不受影响'); }
+    },
     onIncident: (error, context) => incidentPilot?.capture(error, context)
   });
   let identityPilot = null;
@@ -249,7 +258,9 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     canWork: (chat) => chat ? canRun(chat) : getConfig().runtime?.mode === 'active' && !getConfig().runtime?.paused && isTimeActive(),
     extract: extractSlang, research: researchSlang
   });
+  const personalityLearning = new PersonalityLearning({ dataDir: DATA_DIR, allowed: (chat) => chatAllowed(chat) });
   const orchestrator = new Orchestrator({
+    getPersonalityLearning: () => personalityLearning,
     getSlangLearning: () => slangLearning,
     store,
     memory,
@@ -1110,6 +1121,34 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
       if (!authorize(req)) return json(res, 401, { error: '未授权' });
       const method = req.method;
       const cfgNow = getConfig();
+
+      if (pathname.startsWith('/api/personality-learning/')) {
+        try {
+          const action = pathname.slice('/api/personality-learning/'.length);
+          if (method === 'GET' && action === 'status') return json(res, 200, personalityLearning.status());
+          if (method === 'GET' && action === 'data') return json(res, 200, personalityLearning.snapshot());
+          if (method === 'POST') {
+            if (!cfgNow.admin?.ownerUin) return json(res, 403, { error: '须先配置全局管理员' });
+            const body = await readBody(req);
+            if (action === 'settings') {
+              const { confirm, ...patch } = body;
+              return json(res, 200, personalityLearning.configure(patch, confirm === true));
+            }
+            if (body.confirm !== true) return json(res, 409, { error: '此操作需要明确确认' });
+            if (action === 'analyze') return json(res, 200, personalityLearning.analyze());
+            if (action === 'feedback') return json(res, 200, personalityLearning.feedback(body));
+            if (action === 'cleanup') { personalityLearning.cleanup(); return json(res, 200, { ok: true }); }
+            if (action === 'habit') return json(res, 200, { version: personalityLearning.change(body.id, body.status, body.expectedVersion) });
+            if (action === 'global') return json(res, 200, { version: personalityLearning.promoteGlobal(body.id, body.expectedVersion) });
+            if (action === 'rollback') return json(res, 200, { version: personalityLearning.rollback(body.version, body.expectedVersion) });
+          }
+          return json(res, 404, { error: '未知人格学习接口' });
+        } catch (error) {
+          // Only module-authored validation messages are suitable for operators.
+          log('[personality-learning] 管理操作失败；原有聊天继续');
+          return json(res, 400, { error: '操作未完成，请检查设置、授权群、证据阈值和当前版本；原数据未重置' });
+        }
+      }
 
       if (pathname.startsWith('/api/slang-learning/')) {
         try {
@@ -2965,6 +3004,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     }
     refreshTimeControl();
     orchestrator.startRecoveryLoop();
+    personalityLearning.start();
     try { await slangLearning.sync(); }
     catch { log('[slang-learning] 后台模块启动失败；聊天主流程继续'); }
     if (getConfig().dailyMoments?.enabled) dailyMoments.start();
@@ -2988,6 +3028,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     identityPilot?.stop();
     identityPilot = null;
     await slangLearning.stop();
+    personalityLearning.stop();
     bridgeReceipts.close();
     await slangPilot?.stop();
     slangPilot = null;
@@ -3024,6 +3065,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     sender,
     sessions,
     orchestrator,
+    personalityLearning,
     dailyMoments,
     qzoneInteractions,
     assetObserver,
