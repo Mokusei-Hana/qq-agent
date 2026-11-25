@@ -24,7 +24,9 @@ import { vendorOfConfig } from './model-prices.js';
 import { sleep, randInt, createEventBus, todayKey } from './util.js';
 import { buildSystemPrompt, buildUserPrompt, resolveContextTier } from './prompt.js';
 import { chatCompletion, chatCompletionWithRetry, addUsage, isRetryableError } from './llm.js';
-import { buildToolDefs, toOpenAiTools, executeTool } from './tools.js';
+import { buildToolDefs, toOpenAiTools, executeTool, selectToolDefs } from './tools.js';
+import { slangApproval } from './slang-learning-tools.js';
+import { moderationRequest, parseModerationRequest } from './group-moderation.js';
 import { modelImageVerdict } from './vision-scan.js';
 import { currentProviders } from './providers.js';
 import { buildSlangContextForChat } from './asset-observer.js';
@@ -167,9 +169,13 @@ export class Orchestrator {
     emit = null,
     random = Math.random,
     getIdentityPilot = null,
-    getIncidentPilot = null
+    getIncidentPilot = null,
+    getSlangLearning = () => null,
+    getPersonalityLearning = () => null
   }) {
     this.store = store;
+    this.getSlangLearning = getSlangLearning;
+    this.getPersonalityLearning = getPersonalityLearning;
     this.memory = memory;
     this.stickers = stickers;
     this.sender = sender;
@@ -192,6 +198,7 @@ export class Orchestrator {
     this.runTasks = new Set();
     this.retryTimer = null;
     this.consolidating = new Set();    // 正在整理记忆的 chatKey
+    this.consolidationAttempts = new Map(); // chatKey -> 最近一次尝试（元数据写入失败时的内存兜底）
     this.runningChats = new Set();     // 正在运行的 chatKey
     this.activeRuns = new Map();       // chatKey -> sessionId
     this.runSeq = new Map();           // chatKey -> 第几次处理（跨重启清零即可）
@@ -269,6 +276,7 @@ export class Orchestrator {
     this.store.recoverExpired();
     this.store.expireConversationThreads?.();
     this.retryTimer = setInterval(() => {
+      try { this.getPersonalityLearning()?.maintenance(); } catch { /* Learning must not block recovery. */ }
       this.store.recoverExpired();
       this.store.expireConversationThreads?.();
       if (this.paused || this.aborted) return;
@@ -308,6 +316,10 @@ export class Orchestrator {
     const cfg = getConfig();
     const conversation = conversationConfigForChat(chatKey);
     const entries = this.store.peekUnread(chatKey, 100) || [];
+    if (chatKey.startsWith('group:') && entries.some((entry) => parseModerationRequest(entry, this.onebot.selfId))) {
+      return { shouldRespond: true, tier: 1, count: cfg.store.atCount,
+        reason: '独立群管理请求', conversationMode: conversation.mode };
+    }
     if (chatKey.startsWith('private:')) {
       return {
         shouldRespond: entries.length > 0,
@@ -704,7 +716,9 @@ export class Orchestrator {
 
     const runTimeoutMs = Math.min(240000, Math.max(1000, Number(cfgNow.api.runTimeoutMs) || 180000));
     const lease = proactive ? null : this.store.claimUnread(chatKey, {
-      limit: cfgNow.store.batchLimit, maxChars: cfgNow.store.batchMaxChars, leaseMs: runTimeoutMs + 60000
+      limit: cfgNow.store.batchLimit, maxChars: cfgNow.store.batchMaxChars, leaseMs: runTimeoutMs + 60000,
+      isolateMessage: chatKey.startsWith('group:')
+        ? (entry) => Boolean(parseModerationRequest(entry, this.onebot.selfId)) : null
     });
     const triggerEntries = lease?.messages || [];
     if (!proactive && triggerEntries.length === 0) {
@@ -777,7 +791,7 @@ export class Orchestrator {
         manual, contextLimit: tierResult.count, tierInfo: tierResult, conversation, signal: controller.signal });
       controller.signal.throwIfAborted();
       // #region debug-point A:agent-run-result
-      (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'A', location: 'src/orchestrator.js:#wake', msg: '[DEBUG] Agent run completed before lifecycle commit', data: { chatKey, sessionId: session.id, conversationMode: conversation.mode, sentCount: session.sent.length, threadDisposition: session.threadDisposition || null, finishReason: session.finishReason || '', clearHandoff: session.handoffDraft?.clearHandoff === true, triggerCount: triggerEntries.length }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
+      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'A', location: 'src/orchestrator.js:#wake', msg: '[DEBUG] Agent run completed before lifecycle commit', data: { chatKey, sessionId: session.id, conversationMode: conversation.mode, sentCount: session.sent.length, threadDisposition: session.threadDisposition || null, finishReason: session.finishReason || '', clearHandoff: session.handoffDraft?.clearHandoff === true, triggerCount: triggerEntries.length }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
       // #endregion
       if (conversation.mode === 'lifecycle') {
         const handoff = this.#commitSessionHandoff(session, { chatKey, triggerEntries });
@@ -795,6 +809,13 @@ export class Orchestrator {
       }
       const status = session.sent.length > 0 ? 'done' : 'noreply';
       this.sessions.finish(session.id, status);
+      if (status === 'noreply') {
+        try {
+          const last = triggerEntries.filter(m => !m.self).at(-1);
+          this.getPersonalityLearning()?.observe({ chatKey, text: '', messageId: 'silence:' + session.id,
+            silence: true, context: last?.text || '', sourceId: last?.senderId || '' });
+        } catch { /* Silence is a valid choice, never a learning failure for chat. */ }
+      }
       this.emit('session-end', { sessionId: session.id, chatKey, status,
         sent: session.sent.length, finishReason: session.finishReason, usage: session.usage });
       if (!manual && !proactive && triggerEntries.length > 0) {
@@ -823,7 +844,7 @@ export class Orchestrator {
         });
       }
       // #region debug-point C-D:agent-run-failed
-      if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C,D', location: 'src/orchestrator.js:#wake.catch', msg: '[DEBUG] Agent run failed', data: { sessionId: session.id, threadId: session.threadId || null, error: session.error.slice(0, 500), rounds: session.rounds, calls: session.usage.calls, cumulativeRunTokens: session.usage.totalTokens, promptTokens: session.usage.promptTokens, completionTokens: session.usage.completionTokens, sentCount: session.sent.length, hasEffects: lease ? this.store.hasEffects(lease.id) : false, hasUncertainEffects: lease ? this.store.hasUncertainEffects(lease.id) : false, triggerCount: triggerEntries.length }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C,D', location: 'src/orchestrator.js:#wake.catch', msg: '[DEBUG] Agent run failed', data: { sessionId: session.id, threadId: session.threadId || null, error: session.error.slice(0, 500), rounds: session.rounds, calls: session.usage.calls, cumulativeRunTokens: session.usage.totalTokens, promptTokens: session.usage.promptTokens, completionTokens: session.usage.completionTokens, sentCount: session.sent.length, hasEffects: lease ? this.store.hasEffects(lease.id) : false, hasUncertainEffects: lease ? this.store.hasUncertainEffects(lease.id) : false, triggerCount: triggerEntries.length }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
       // #endregion
       if (lease) {
         if (timeClosed && !this.store.hasEffects(lease.id)) this.store.ackLease(lease.id);
@@ -917,7 +938,7 @@ export class Orchestrator {
     const mode = conversation?.mode || 'legacy';
     const currentMode = conversationConfigForChat(chatKey).mode;
     // #region debug-point D:commit-mode-check
-    (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'D', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Conversation mode checked at commit', data: { chatKey, sessionId: session.id, capturedMode: mode, currentMode }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
+    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'D', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Conversation mode checked at commit', data: { chatKey, sessionId: session.id, capturedMode: mode, currentMode }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
     // #endregion
     if (currentMode !== mode) {
       if (mode === 'lifecycle') {
@@ -952,7 +973,7 @@ export class Orchestrator {
         || session.sent.length > 0
         || Boolean(session.threadDisposition);
       // #region debug-point B:lifecycle-commit-decision
-      (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'B', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Lifecycle commit decision derived', data: { chatKey, sessionId: session.id, sentCount: session.sent.length, hasOpenWork, explicitDisposition: session.threadDisposition || null, disposition, clearHandoff: session.handoffDraft?.clearHandoff === true, closeReason, persistThread }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
+      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'B', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Lifecycle commit decision derived', data: { chatKey, sessionId: session.id, sentCount: session.sent.length, hasOpenWork, explicitDisposition: session.threadDisposition || null, disposition, clearHandoff: session.handoffDraft?.clearHandoff === true, closeReason, persistThread }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
       // #endregion
       const checkpointState = handoff || session.handoffDraft || {
         summary: session.sent.length
@@ -993,10 +1014,10 @@ export class Orchestrator {
       if (closeReason) session.threadCloseReason = closeReason;
       session.threadTranscriptChars = result.transcriptChars;
       // #region debug-point A-C-E:lifecycle-context-committed
-      if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,C,E', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Lifecycle context committed', data: { sessionId: session.id, threadId: result.thread?.threadId || null, threadState: result.thread?.state || null, disposition: result.thread?.disposition || null, deltaMessageCount: runResult?.providerTranscriptDelta?.length || 0, deltaChars: JSON.stringify(runResult?.providerTranscriptDelta || []).length, transcriptChars: result.transcriptChars, maxTranscriptChars: Number(conversation?.maxTranscriptChars) || 0, promptTokensLastCall: session.callUsage?.at(-1)?.promptTokens || 0, cumulativeRunTokens: session.usage.totalTokens, forceRollover: runResult?.forceThreadRollover || '' }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,C,E', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Lifecycle context committed', data: { sessionId: session.id, threadId: result.thread?.threadId || null, threadState: result.thread?.state || null, disposition: result.thread?.disposition || null, deltaMessageCount: runResult?.providerTranscriptDelta?.length || 0, deltaChars: JSON.stringify(runResult?.providerTranscriptDelta || []).length, transcriptChars: result.transcriptChars, maxTranscriptChars: Number(conversation?.maxTranscriptChars) || 0, promptTokensLastCall: session.callUsage?.at(-1)?.promptTokens || 0, cumulativeRunTokens: session.usage.totalTokens, forceRollover: runResult?.forceThreadRollover || '' }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
       // #endregion
       // #region debug-point E:lifecycle-commit-result
-      (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'E', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Lifecycle transaction committed', data: { chatKey, sessionId: session.id, acknowledged: result.acknowledged, threadId: result.thread?.threadId || null, threadState: result.thread?.state || null, disposition: result.thread?.disposition || null, idleDeadline: result.thread?.idleDeadline || 0, hardDeadline: result.thread?.hardDeadline || 0, resumeArmedUntil: result.thread?.resumeArmedUntil || 0, transcriptChars: result.transcriptChars }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
+      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'E', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Lifecycle transaction committed', data: { chatKey, sessionId: session.id, acknowledged: result.acknowledged, threadId: result.thread?.threadId || null, threadState: result.thread?.state || null, disposition: result.thread?.disposition || null, idleDeadline: result.thread?.idleDeadline || 0, hardDeadline: result.thread?.hardDeadline || 0, resumeArmedUntil: result.thread?.resumeArmedUntil || 0, transcriptChars: result.transcriptChars }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
       // #endregion
       return;
     }
@@ -1073,7 +1094,11 @@ export class Orchestrator {
     if (cfg.sticker?.enabled !== false) {
       try { stickerEntries = (await this.stickers.sync(false)).entries ?? []; } catch { stickerEntries = []; }
     }
-    const slangContext = slangPilotEnabled(cfg)
+    const slangLearning = this.getSlangLearning();
+    const approval = slangApproval(triggerEntries, cfg.admin?.ownerUin);
+    const slangContext = slangLearning?.active
+      ? slangLearning.context(chatKey, triggerEntries.map(m => m.text || '').join('\n'))
+      : slangPilotEnabled(cfg)
       ? buildSlangContextForChat(chatKey, { max: 8 })
       : '';
     const incidentContext = this.getIncidentPilot()?.active
@@ -1087,18 +1112,24 @@ export class Orchestrator {
     const identityPilot = this.getIdentityPilot();
     const identityAvailable = identityPilotEnabled(cfg) && identityPilot?.active === true;
     const friendProposalAvailable = identityAvailable && promptFriendProposalEnabled(cfg);
-    const toolDefs = this.toolDefs.filter((d) => {
-      if (!visionEnabled && (d.name === 'get_message_images' || d.name === 'get_sticker_image')) return false;
-      if (!searchEnabled && (d.name === 'web_search' || d.name === 'web_fetch')) return false;
-      if (d.feature === 'identityPilot' && !identityAvailable) return false;
-      if (d.feature === 'friendProposal' && !friendProposalAvailable) return false;
-      return true;
+    const currentModerationRequest = moderationRequest(triggerEntries, { proactive, manual, selfId: this.onebot.selfId });
+    const toolDefs = selectToolDefs(this.toolDefs, {
+      slangAvailable: slangLearning?.active === true,
+      slangReviewAvailable: Boolean(approval),
+      kind, visionEnabled, searchEnabled, identityAvailable, friendProposalAvailable,
+      moderationAvailable: Boolean(currentModerationRequest)
     });
     const openAiTools = toOpenAiTools(toolDefs);
     const systemPrompt = buildSystemPrompt({
       identityPilotAvailable: identityAvailable,
       friendProposalAvailable
     });
+    const personalityInput = triggerEntries.map(m => m.text || '').join('\n');
+    let personalityContext = '', personalityFingerprint = '';
+    try {
+      personalityContext = this.getPersonalityLearning()?.preferences(chatKey, personalityInput) || '';
+      personalityFingerprint = this.getPersonalityLearning()?.fingerprint(chatKey, personalityInput) || '';
+    } catch { /* The original prompt remains usable when learning fails. */ }
     const promptPrefixHash = crypto.createHash('sha256')
       .update(String(cfg.api.provider || ''))
       .update('\0')
@@ -1109,6 +1140,7 @@ export class Orchestrator {
       .update(systemPrompt)
       .update('\0')
       .update(JSON.stringify(openAiTools))
+      .update(personalityFingerprint)
       .digest('hex');
 
     let priorProviderMessages = [];
@@ -1124,7 +1156,7 @@ export class Orchestrator {
         const previousThreadId = thread.threadId;
         const previousPromptTokens = thread.promptTokens;
         // #region debug-point C-E:token-rollover
-        if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C,E', location: 'src/orchestrator.js:#runAgent', msg: '[DEBUG] Lifecycle generation rolled before model request', data: { sessionId: session.id, previousThreadId, previousPromptTokens, threshold: Number(conversationCfg.lifecycleRolloverInputTokens) || 32000, storedTranscriptChars: thread.transcriptChars || 0 }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+        if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C,E', location: 'src/orchestrator.js:#runAgent', msg: '[DEBUG] Lifecycle generation rolled before model request', data: { sessionId: session.id, previousThreadId, previousPromptTokens, threshold: Number(conversationCfg.lifecycleRolloverInputTokens) || 32000, storedTranscriptChars: thread.transcriptChars || 0 }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
         // #endregion
         this.store.armLifecycleRollover?.(
           chatKey,
@@ -1147,17 +1179,19 @@ export class Orchestrator {
       : null;
     const lifecycleContinuation = priorProviderMessages.length > 0;
     // #region debug-point A-B-E:lifecycle-context-loaded
-    if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const priorChars = JSON.stringify(priorProviderMessages).length; const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,B,E', location: 'src/orchestrator.js:#runAgent', msg: '[DEBUG] Lifecycle context loaded', data: { sessionId: session.id, threadId: thread?.threadId || null, threadState: thread?.state || null, threadOpenedAt: thread?.openedAt || 0, threadAgeMs: thread?.openedAt ? Date.now() - thread.openedAt : 0, storedTranscriptChars: thread?.transcriptChars || 0, priorMessageCount: priorProviderMessages.length, priorChars, lifecycleContinuation, contextLimit, maxTranscriptChars: Number(conversationCfg.maxTranscriptChars) || 0, hardLifetimeMs: Number(conversationCfg.hardLifetimeMs) || 0 }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const priorChars = JSON.stringify(priorProviderMessages).length; const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,B,E', location: 'src/orchestrator.js:#runAgent', msg: '[DEBUG] Lifecycle context loaded', data: { sessionId: session.id, threadId: thread?.threadId || null, threadState: thread?.state || null, threadOpenedAt: thread?.openedAt || 0, threadAgeMs: thread?.openedAt ? Date.now() - thread.openedAt : 0, storedTranscriptChars: thread?.transcriptChars || 0, priorMessageCount: priorProviderMessages.length, priorChars, lifecycleContinuation, contextLimit, maxTranscriptChars: Number(conversationCfg.maxTranscriptChars) || 0, hardLifetimeMs: Number(conversationCfg.hardLifetimeMs) || 0 }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
     // #endregion
 
     // 首轮带完整上下文；生命周期后续轮只附加增量，旧消息保持字节级稳定以命中 DeepSeek 前缀缓存。
     const userPrompt = buildUserPrompt({
       chatKey, kind, chatId, chatName,
+      moderationRequest: currentModerationRequest,
       triggerEntries,
       store: this.store,
       memory: this.memory,
       stickerEntries,
       slangContext,
+      personalityContext,
       incidentContext,
       selfNickname,
       selfLastMessageAt,
@@ -1223,7 +1257,10 @@ export class Orchestrator {
     session.promptPrefixHash = promptPrefixHash;
 
     const ctx = {
+      slangLearning,
+      slangApproval: approval,
       chatKey, kind, chatId,
+      moderationRequest: currentModerationRequest,
       selfId: this.onebot.selfId,
       selfNickname,
       botName: cfg.persona.botName,
@@ -1277,11 +1314,11 @@ export class Orchestrator {
       } = estimate;
       const outputReserveTokens = 2048;
       // #region debug-point A-C-D:request-budget-check
-      if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const stats = {}; for (const message of messages) { const role = String(message?.role || 'unknown'); const row = stats[role] ||= { count: 0, jsonChars: 0, contentChars: 0, reasoningChars: 0, toolArgChars: 0 }; row.count += 1; row.jsonChars += JSON.stringify(message).length; row.contentChars += typeof message?.content === 'string' ? message.content.length : JSON.stringify(message?.content ?? '').length; row.reasoningChars += String(message?.reasoning_content || '').length; row.toolArgChars += (message?.tool_calls || []).reduce((sum, call) => sum + String(call?.function?.arguments || '').length, 0); } const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,C,D', location: 'src/orchestrator.js:#runAgent.round', msg: '[DEBUG] Request budget evaluated', data: { sessionId: session.id, threadId: thread?.threadId || null, round: round + 1, maxRounds, messageCount: messages.length, messageChars: JSON.stringify(messages).length, toolSchemaChars: JSON.stringify(openAiTools).length, cumulativeRunTokens: Number(session.usage.totalTokens) || 0, maxRunTokens, estimatedPromptTokens, outputReserveTokens, projectedRunTokens: Number(session.usage.totalTokens) + estimatedPromptTokens + outputReserveTokens, roles: stats }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const stats = {}; for (const message of messages) { const role = String(message?.role || 'unknown'); const row = stats[role] ||= { count: 0, jsonChars: 0, contentChars: 0, reasoningChars: 0, toolArgChars: 0 }; row.count += 1; row.jsonChars += JSON.stringify(message).length; row.contentChars += typeof message?.content === 'string' ? message.content.length : JSON.stringify(message?.content ?? '').length; row.reasoningChars += String(message?.reasoning_content || '').length; row.toolArgChars += (message?.tool_calls || []).reduce((sum, call) => sum + String(call?.function?.arguments || '').length, 0); } const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,C,D', location: 'src/orchestrator.js:#runAgent.round', msg: '[DEBUG] Request budget evaluated', data: { sessionId: session.id, threadId: thread?.threadId || null, round: round + 1, maxRounds, messageCount: messages.length, messageChars: JSON.stringify(messages).length, toolSchemaChars: JSON.stringify(openAiTools).length, cumulativeRunTokens: Number(session.usage.totalTokens) || 0, maxRunTokens, estimatedPromptTokens, outputReserveTokens, projectedRunTokens: Number(session.usage.totalTokens) + estimatedPromptTokens + outputReserveTokens, roles: stats }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
       // #endregion
       if (session.usage.totalTokens + estimatedPromptTokens + outputReserveTokens > maxRunTokens) {
         // #region debug-point C:run-budget-rejected
-        if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C', location: 'src/orchestrator.js:#runAgent.round', msg: '[DEBUG] Run stopped before exceeding token budget', data: { sessionId: session.id, threadId: thread?.threadId || null, nextRound: round + 1, cumulativeRunTokens: Number(session.usage.totalTokens) || 0, estimatedPromptTokens, outputReserveTokens, projectedRunTokens: Number(session.usage.totalTokens) + estimatedPromptTokens + outputReserveTokens, maxRunTokens, sentCount: session.sent.length }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+        if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C', location: 'src/orchestrator.js:#runAgent.round', msg: '[DEBUG] Run stopped before exceeding token budget', data: { sessionId: session.id, threadId: thread?.threadId || null, nextRound: round + 1, cumulativeRunTokens: Number(session.usage.totalTokens) || 0, estimatedPromptTokens, outputReserveTokens, projectedRunTokens: Number(session.usage.totalTokens) + estimatedPromptTokens + outputReserveTokens, maxRunTokens, sentCount: session.sent.length }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
         // #endregion
         session.budgetStopped = true;
         session.budgetStopReason = 'next-call-budget';
@@ -1327,7 +1364,7 @@ export class Orchestrator {
         totalTokens: Number(response.usage?.total_tokens) || 0
       });
       // #region debug-point C-D:provider-usage-returned
-      if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C,D', location: 'src/orchestrator.js:#runAgent.response', msg: '[DEBUG] Provider usage returned', data: { sessionId: session.id, threadId: thread?.threadId || null, round: round + 1, promptTokens, completionTokens: Number(response.usage?.completion_tokens) || 0, totalTokens: Number(response.usage?.total_tokens) || 0, cachedTokens: Math.min(promptTokens, cachedTokens), cumulativeRunTokens: Number(session.usage.totalTokens) || 0, finishReason: response.finishReason || null, assistantContentChars: typeof response.message?.content === 'string' ? response.message.content.length : 0, reasoningChars: String(response.message?.reasoning_content || '').length, toolNames: (response.message?.tool_calls || []).map((call) => call?.function?.name || '') }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C,D', location: 'src/orchestrator.js:#runAgent.response', msg: '[DEBUG] Provider usage returned', data: { sessionId: session.id, threadId: thread?.threadId || null, round: round + 1, promptTokens, completionTokens: Number(response.usage?.completion_tokens) || 0, totalTokens: Number(response.usage?.total_tokens) || 0, cachedTokens: Math.min(promptTokens, cachedTokens), cumulativeRunTokens: Number(session.usage.totalTokens) || 0, finishReason: response.finishReason || null, assistantContentChars: typeof response.message?.content === 'string' ? response.message.content.length : 0, reasoningChars: String(response.message?.reasoning_content || '').length, toolNames: (response.message?.tool_calls || []).map((call) => call?.function?.name || '') }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
       // #endregion
 
       const msg = response.message;
@@ -1484,7 +1521,7 @@ export class Orchestrator {
     });
     const containsInlineImage = hasInlineImage(providerTranscriptDelta);
     // #region debug-point A-D:lifecycle-delta-ready
-    if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,D', location: 'src/orchestrator.js:#runAgent.return', msg: '[DEBUG] Lifecycle transcript delta ready', data: { sessionId: session.id, threadId: thread?.threadId || null, messageCount: providerTranscriptDelta.length, deltaChars: JSON.stringify(providerTranscriptDelta).length, containsInlineImage, sentCount: session.sent.length, rounds: session.rounds }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,D', location: 'src/orchestrator.js:#runAgent.return', msg: '[DEBUG] Lifecycle transcript delta ready', data: { sessionId: session.id, threadId: thread?.threadId || null, messageCount: providerTranscriptDelta.length, deltaChars: JSON.stringify(providerTranscriptDelta).length, containsInlineImage, sentCount: session.sent.length, rounds: session.rounds }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
     // #endregion
     return {
       providerTranscriptDelta: containsInlineImage ? [] : providerTranscriptDelta,
@@ -1521,7 +1558,7 @@ export class Orchestrator {
   startProactiveLoop() {
     this.stopProactiveLoop();
     // #region debug-point A-C:proactive-loop-restart
-    if (!String(process.argv[1]).includes('/test/')) (() => { try { const cfg = getConfig(); const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,C', location: 'src/orchestrator.js:startProactiveLoop', msg: '[DEBUG] Proactive loop restarted', data: { enabled: cfg.proactive?.enabled === true, initialDelayMs: 15000, checkIntervalMinMs: cfg.proactive?.checkIntervalMinMs, checkIntervalMaxMs: cfg.proactive?.checkIntervalMaxMs, probability: cfg.proactive?.probability, suppressions: [...this.proactiveSuppressions] }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
+    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!String(process.argv[1]).includes('/test/')) (() => { try { const cfg = getConfig(); const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,C', location: 'src/orchestrator.js:startProactiveLoop', msg: '[DEBUG] Proactive loop restarted', data: { enabled: cfg.proactive?.enabled === true, initialDelayMs: 15000, checkIntervalMinMs: cfg.proactive?.checkIntervalMinMs, checkIntervalMaxMs: cfg.proactive?.checkIntervalMaxMs, probability: cfg.proactive?.probability, suppressions: [...this.proactiveSuppressions] }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
     // #endregion
     const tick = async () => {
       const cfg = getConfig();
@@ -1533,7 +1570,7 @@ export class Orchestrator {
       if (this.aborted || this.paused || cfg.proactive?.enabled !== true) return;
       if (this.proactiveSuppressions.size > 0) {
         // #region debug-point A-C:proactive-tick-suppressed
-        if (!String(process.argv[1]).includes('/test/')) (() => { try { const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,C', location: 'src/orchestrator.js:startProactiveLoop.tick', msg: '[DEBUG] Proactive tick suppressed by background task', data: { suppressions: [...this.proactiveSuppressions], nextDelayMs: next }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
+        if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!String(process.argv[1]).includes('/test/')) (() => { try { const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,C', location: 'src/orchestrator.js:startProactiveLoop.tick', msg: '[DEBUG] Proactive tick suppressed by background task', data: { suppressions: [...this.proactiveSuppressions], nextDelayMs: next }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
         // #endregion
         return;
       }
@@ -1544,7 +1581,7 @@ export class Orchestrator {
       if (!candidates.length) return;
       const chatKey = candidates[Math.floor(Math.random() * candidates.length)];
       // #region debug-point A-C:proactive-chat-selected
-      if (!String(process.argv[1]).includes('/test/')) (() => { try { const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,C', location: 'src/orchestrator.js:startProactiveLoop.tick', msg: '[DEBUG] Proactive loop selected a chat', data: { chatKey, candidateCount: candidates.length, runningChats: this.runningChats.size }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
+      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!String(process.argv[1]).includes('/test/')) (() => { try { const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,C', location: 'src/orchestrator.js:startProactiveLoop.tick', msg: '[DEBUG] Proactive loop selected a chat', data: { chatKey, candidateCount: candidates.length, runningChats: this.runningChats.size }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
       // #endregion
       this.wake(chatKey, { proactive: true }).catch((error) => console.error('[orchestrator] proactive 出错:', error));
     };
@@ -1582,34 +1619,146 @@ export class Orchestrator {
   // 否则记忆为空的群点整理会得到"没有可整理的群友"，功能对新群完全无效。
   static DISCOVER_MIN_MESSAGES = 20;      // 至少发过这么多条才值得分析
   static DISCOVER_MAX_MEMBERS = 3;        // 单次最多发现几个人（控制成本）
+  // ── 冷启动 ──
+  // 记忆为空的群永远不会达到"印象条数超过阈值"，自动整理因此从未被调用过。
+  // 这里单独开一个首次整理入口：群消息攒够、且最近确实有人说话时允许跑一次。
+  static COLD_START_MIN_MESSAGES = 20;
+  static COLD_START_ACTIVE_MS = 24 * 60 * 60 * 1000;
+  // ── 失败/空目标退避 ──
+  static CONSOLIDATE_RETRY_MS = 15 * 60 * 1000;
+  static CONSOLIDATE_RETRY_MAX_MS = 6 * 60 * 60 * 1000;
+  static CONSOLIDATE_NO_TARGET_COOLDOWN_MS = 60 * 60 * 1000;
+
+  /**
+   * 判断当前会话本次是否应该自动整理长期人物记忆。
+   * 返回 { reason, coldStart, state }；返回 null 表示不整理。
+   *
+   * 触发条件二选一（都要先满足启停、模型、并发与冷却约束）：
+   *   A. 原有策略：全群印象总数超过阈值，或任一成员印象数超过上限；
+   *   B. 冷启动：仅群聊、当前群印象数为 0、消息总量达到门槛、最近 24 小时有真人消息。
+   * 私聊不启用冷启动，保持原有阈值行为。
+   */
+  memoryConsolidationPlan(chatKey, { now = Date.now() } = {}) {
+    const cfg = getConfig();
+    if (!canRun(chatKey)) return null;
+    if (cfg.memory?.consolidateEnabled === false) return null;
+    if (this.paused || this.aborted) return null;
+    if (!cfg.api?.model || !cfg.api?.baseUrl) return null;   // 没选模型就不整理
+    if (this.consolidating.has(chatKey)) return null;
+    const st = this.#consolidationStatus(chatKey);
+    const minInterval = Math.max(30 * 60 * 1000,
+      Number(cfg.memory?.consolidateMinIntervalMs) || 6 * 60 * 60 * 1000);
+    // 成功整理后的冷却与失败/空目标的重试退避分开计算，避免把"尝试过"当成"成功过"。
+    if (now - (Number(st.lastAttemptedAt) || 0) < this.#consolidationRetryDelay(st, cfg, minInterval)) return null;
+
+    // 失败成员的重试优先于阈值、冷启动和旧的整群成功冷却：
+    // 它不依赖"当前群还没有印象"，也不会重复整理已经成功的人。
+    const retryMembers = Array.isArray(st.retryMembers) ? st.retryMembers.filter((m) => m?.userId) : [];
+    if (retryMembers.length) {
+      return {
+        reason: 'retry-failed-members',
+        coldStart: false,
+        retryUserIds: retryMembers.map((m) => String(m.userId)),
+        state: st
+      };
+    }
+
+    // 没有待重试成员时，原有成功冷却继续生效。
+    if (now - (Number(st.lastConsolidatedAt) || 0) < minInterval) return null;
+
+    // 阈值可配置：config.memory.consolidateMinImpressions（默认取类常量）
+    const minImpressions = Math.max(1,
+      Number(cfg.memory?.consolidateMinImpressions) || Orchestrator.MEMORY_THRESHOLDS.memberImpression);
+    // 触发条件二选一：
+    //   A. 全群印象总数超过阈值
+    //   B. 任一成员的印象条数超过上限
+    // 只看总数会在"人少"的群里彻底失灵 —— 比如 3 位成员各 1 条，
+    // 总数 3 永远够不到阈值，自动整理形同虚设。
+    const maxPerMember = Math.max(2, Number(cfg.memory?.maxImpressionsPerMember) || 5);
+    const members = Array.isArray(st.members) ? st.members : [];
+    const anyMemberOverloaded = members.some((m) => Number(m.count) > maxPerMember);
+    const impressionCount = Number(st.counts?.memberImpression) || 0;
+    if (impressionCount > minImpressions || anyMemberOverloaded) {
+      return {
+        reason: anyMemberOverloaded ? 'member-overloaded' : 'impressions',
+        coldStart: false,
+        state: st
+      };
+    }
+    // 冷启动只打开"首次整理"，已有印象后完全回到原有阈值策略。
+    if (!String(chatKey).startsWith('group:')) return null;
+    if (impressionCount > 0) return null;
+    const meta = typeof this.store?.getChatMeta === 'function' ? this.store.getChatMeta(chatKey) : null;
+    // 冷启动只看真实聊天消息：排除机器人回复、拍一拍和系统事件。
+    const messageCount = Number(meta?.incomingCount ?? meta?.total) || 0;
+    if (messageCount < Orchestrator.COLD_START_MIN_MESSAGES) return null;
+    // 必须来自真实存储：优先取最近一条真人消息，回退到会话最后一条消息时间。
+    const lastIncomingAt = typeof this.store?.lastIncomingTs === 'function'
+      ? Number(this.store.lastIncomingTs(chatKey)) || 0
+      : Number(meta?.lastTs) || 0;
+    if (!lastIncomingAt || now - lastIncomingAt > Orchestrator.COLD_START_ACTIVE_MS) return null;
+    return { reason: 'cold-start', coldStart: true, state: st, messageCount, lastIncomingAt };
+  }
+
+  /**
+   * 失败与空目标的重试间隔：基础 15 分钟，连续失败指数退避，封顶 6 小时。
+   * no_targets 只做一小时冷却（此时不调模型，代价很低）。
+   */
+  #consolidationRetryDelay(st, cfg, minInterval) {
+    const base = Math.max(60 * 1000,
+      Number(cfg.memory?.consolidateRetryMs) || Orchestrator.CONSOLIDATE_RETRY_MS);
+    const cap = Math.max(base, Math.min(minInterval, Orchestrator.CONSOLIDATE_RETRY_MAX_MS));
+    if (String(st.lastResult || '') === 'no_targets') {
+      const noTarget = Math.max(base,
+        Number(cfg.memory?.consolidateNoTargetCooldownMs) || Orchestrator.CONSOLIDATE_NO_TARGET_COOLDOWN_MS);
+      return Math.min(cap, noTarget);
+    }
+    const failures = Math.min(6, Math.max(0, Number(st.consecutiveFailures) || 0));
+    return Math.min(cap, base * (2 ** failures));
+  }
+
+  /** 合并持久化元数据与内存兜底，保证 _meta.json 写失败时重试仍然有界。 */
+  #consolidationStatus(chatKey) {
+    const st = this.memory.consolidationState(chatKey);
+    const local = this.consolidationAttempts.get(chatKey);
+    if (!local || Number(local.at) < Number(st.lastAttemptedAt || 0)) return st;
+    return {
+      ...st,
+      lastAttemptedAt: local.at,
+      lastResult: local.result,
+      lastError: local.error || '',
+      retryMembers: Array.isArray(local.retryMembers)
+        ? local.retryMembers
+        : (st.retryMembers || []),
+      consecutiveFailures: Math.max(
+        Number(st.consecutiveFailures) || 0,
+        Number(local.consecutiveFailures) || 0
+      )
+    };
+  }
+
+  /**
+   * 带任务锁的整理入口：同一 chatKey 同时最多一个整理任务。
+   * 已有任务时返回 null；无论成功、失败还是异常，锁都会在结束后释放。
+   */
+  startMemoryConsolidation(chatKey, options = {}) {
+    const key = String(chatKey || '');
+    if (!key || this.consolidating.has(key)) return null;
+    this.consolidating.add(key);
+    return this.consolidateMemoryForChat(key, options)
+      .finally(() => this.consolidating.delete(key));
+  }
 
   #maybeConsolidateMemory(chatKey) {
     try {
-      const cfg = getConfig();
-      if (!canRun(chatKey)) return;
-      if (cfg.memory?.consolidateEnabled === false) return;
-      if (this.paused || this.aborted) return;
-      if (!cfg.api?.model || !cfg.api?.baseUrl) return;   // 没选模型就不整理
-      if (this.consolidating.has(chatKey)) return;
-      const st = this.memory.consolidationState(chatKey);
-      // 阈值可配置：config.memory.consolidateMinImpressions（默认取类常量）
-      // 注意：这里原先误写成裸标识符 T，运行时会抛 ReferenceError 导致自动整理彻底失效。
-      const minImpressions = Math.max(1,
-        Number(cfg.memory?.consolidateMinImpressions) || Orchestrator.MEMORY_THRESHOLDS.memberImpression);
-      // 触发条件二选一：
-      //   A. 全群印象总数超过阈值
-      //   B. 任一成员的印象条数超过上限
-      // 只看总数会在"人少"的群里彻底失灵 —— 比如 3 位成员各 1 条，
-      // 总数 3 永远够不到阈值，自动整理形同虚设。
-      const maxPerMember = Math.max(2, Number(cfg.memory?.maxImpressionsPerMember) || 5);
-      const anyMemberOverloaded = st.members.some((m) => m.count > maxPerMember);
-      if (!(st.counts.memberImpression > minImpressions) && !anyMemberOverloaded) return;
-      const minInterval = Math.max(30 * 60 * 1000, Number(cfg.memory?.consolidateMinIntervalMs) || 6 * 60 * 60 * 1000);
-      if (Date.now() - (st.lastConsolidatedAt || 0) < minInterval) return;
-      this.consolidating.add(chatKey);
-      this.consolidateMemoryForChat(chatKey)
-        .catch((error) => console.error(`[memory] 整理 ${chatKey} 失败:`, error?.message ?? error))
-        .finally(() => this.consolidating.delete(chatKey));
+      const plan = this.memoryConsolidationPlan(chatKey);
+      if (!plan) return;
+      const task = this.startMemoryConsolidation(chatKey, {
+        coldStart: plan.coldStart,
+        reason: plan.reason,
+        retryUserIds: plan.retryUserIds || null
+      });
+      task?.catch((error) => console.error(`[memory] 整理 ${chatKey} 失败:`, error?.message ?? error));
     } catch { /* 整理是锦上添花，绝不影响聊天主流程 */ }
   }
 
@@ -1636,16 +1785,25 @@ export class Orchestrator {
     });
   }
 
-  async #consolidateMemoryForChat(chatKey, { userIds = null, force = false } = {}) {
+  async #consolidateMemoryForChat(chatKey, { userIds = null, force = false, coldStart = false, retryUserIds = null } = {}) {
     const cfg = getConfig();
     if (!cfg.api?.model || !cfg.api?.baseUrl) throw new Error('模型未配置，无法整理记忆');
+    const priorState = this.#consolidationStatus(chatKey);
+    const priorRetry = Array.isArray(priorState.retryMembers) ? priorState.retryMembers : [];
+    // 先记下"尝试"再干活：即使进程中途崩溃，重启后也会按退避等待，
+    // 不会把遗留状态当成仍在运行的任务。
+    this.#markConsolidationAttempt(chatKey, { result: 'running' });
     const notes = cfg.memberNotes || {};
     const only = Array.isArray(userIds) && userIds.length
       ? new Set(userIds.map((u) => String(u ?? '').trim()).filter(Boolean))
       : null;
+    const retryOnly = Array.isArray(retryUserIds) && retryUserIds.length
+      ? new Set(retryUserIds.map((u) => String(u ?? '').trim()).filter((u) => /^\d{1,15}$/.test(u)))
+      : null;
 
     const stats = this.#scanChatActivity(chatKey);
     const existing = this.memory.members(chatKey);
+    const noImpressionsYet = existing.length === 0;
 
     // ── 选出要整理的人 ──
     const targets = [];
@@ -1674,6 +1832,37 @@ export class Orchestrator {
           isNew: true
         });
       }
+    } else if (retryOnly) {
+      // 只重试上一轮明确失败的成员；每次都重新校验身份、发言和现有印象，
+      // 不复用旧的候选人资格，也不重复处理已经成功的人。
+      for (const uid of retryOnly) {
+        const found = existing.find((m) => String(m.userId || '') === uid);
+        if (found) {
+          const resolved = this.#resolveIdentity(chatKey, found, stats, notes);
+          if (this.#shouldSkip(resolved, false)) {
+            skipped.push({ userId: resolved.userId, name: resolved.name, reason: this.#skipReason(resolved) });
+            continue;
+          }
+          targets.push({ ...resolved, isNew: false, retrying: true });
+          continue;
+        }
+        const msgCount = stats.memberMsgCount.get(uid) || 0;
+        if (msgCount < Orchestrator.MEMBER_MIN_MESSAGES) {
+          skipped.push({
+            userId: uid,
+            name: stats.uidToName.get(uid) || notes[uid] || '',
+            reason: '聊天记录出现不足 3 条，暂不重试'
+          });
+          continue;
+        }
+        targets.push({
+          userId: uid,
+          name: stats.uidToName.get(uid) || notes[uid] || `QQ ${uid}`,
+          impressions: [],
+          isNew: true,
+          retrying: true
+        });
+      }
     } else {
       // 先整理记忆里已有的人
       const knownUserIds = new Set();
@@ -1696,10 +1885,17 @@ export class Orchestrator {
       // "没有可整理的群友"，功能形同虚设。
       const discoverMin = Math.max(1,
         Number(cfg.memory?.discoverMinMessages) || Orchestrator.DISCOVER_MIN_MESSAGES);
+      // 冷启动/首次整理时放宽到与单成员整理门槛一致：
+      // 否则一个 20 多人各说两句的新群，永远凑不出"单人发言 20 条"，
+      // 整理入口打开了也依旧没有目标。
+      // 仅对群聊生效；零印象私聊的手动整理保留原有发现门槛。
+      const effectiveDiscoverMin = noImpressionsYet && String(chatKey).startsWith('group:')
+        ? Math.min(discoverMin, Orchestrator.MEMBER_MIN_MESSAGES)
+        : discoverMin;
       const discoverMax = Math.max(1,
         Number(cfg.memory?.discoverMaxMembers) || Orchestrator.DISCOVER_MAX_MEMBERS);
       const discovered = [...stats.memberMsgCount.entries()]
-        .filter(([uid, n]) => n >= discoverMin && !knownUserIds.has(uid))
+        .filter(([uid, n]) => n >= effectiveDiscoverMin && !knownUserIds.has(uid))
         .sort((a, b) => b[1] - a[1])
         .slice(0, discoverMax);
       for (const [uid, n] of discovered) {
@@ -1718,8 +1914,20 @@ export class Orchestrator {
       : '';
 
     if (!targets.length) {
+      // 没有任何目标时不调模型，但必须留下"尝试过"的痕迹，
+      // 否则每条新消息都会重新触发一次同样没有结果的整理。
+      // 重试轮里被重新校验淘汰的成员要从队列移除；普通整理则保留旧队列。
+      const retryMembers = this.#nextRetryMembers(priorRetry, retryOnly, [], [], Date.now());
+      this.#markConsolidationAttempt(chatKey, {
+        result: 'no_targets',
+        error: skipped.length ? `跳过 ${skipped.length} 位` : '',
+        retryMembers
+      });
       return {
         ok: true,
+        status: 'no_targets',
+        reason: 'no_targets',
+        retryCount: retryMembers.length,
         note: `没有可整理的群友${skippedNote || (only ? '（未指定有效群友）' : '（该群还没有任何群友印象，且聊天记录里没有发言足够多的活跃成员）')}`,
         changed: 0,
         results: [],
@@ -1739,7 +1947,11 @@ export class Orchestrator {
       const before = mem.impressions.map((e) => e.content);
       try {
         const next = await this.#consolidateOneMember(chatKey, mem, { force, stats });
-        if (!next) { failed.push({ userId: mem.userId, name: mem.name, reason: '模型返回无法解析' }); continue; }
+        if (!next) {
+          failed.push({ userId: mem.userId, name: mem.name, reason: '模型没有返回可写入的印象' });
+          this.#persistRetryProgress(chatKey, priorRetry, retryOnly, results, failed);
+          continue;
+        }
         const after = next.impressions.map((e) => e.content);
         const isChanged = after.length !== before.length || after.some((c, i) => c !== before[i]);
         if (isChanged) changed += 1;
@@ -1753,15 +1965,115 @@ export class Orchestrator {
         });
       } catch (error) {
         failed.push({ userId: mem.userId, name: mem.name, reason: String(error?.message ?? error) });
+        this.#persistRetryProgress(chatKey, priorRetry, retryOnly, results, failed);
       }
     }
 
-    const discoveredCount = targets.filter((t) => t.isNew).length;
+    const discoveredCount = targets.filter((t) => t.isNew && !t.retrying).length;
     const note = this.#buildConsolidateNote({
       total: targets.length, changed, failed, skipped, only, discoveredCount
     });
-    this.#markConsolidated(chatKey, targets.map((t) => t.userId).filter(Boolean));
-    return { ok: true, note, changed, results, skipped, failed };
+    // 中途中断时，没跑到的目标也算待重试，不能被静默丢掉。
+    const handledIds = new Set([
+      ...results.map((r) => String(r.userId || '')),
+      ...failed.map((f) => String(f.userId || ''))
+    ]);
+    const pendingFailures = this.aborted
+      ? targets
+        .filter((t) => !handledIds.has(String(t.userId || '')))
+        .map((t) => ({ userId: t.userId, name: t.name, reason: '整理被中断' }))
+      : [];
+    const allFailures = [...failed, ...pendingFailures];
+    const at = Date.now();
+    const retryMembers = this.#nextRetryMembers(priorRetry, retryOnly, results, allFailures, at);
+    const successIds = results.map((r) => r.userId).filter(Boolean);
+
+    let status;
+    if (!results.length) status = 'failed';
+    else if (allFailures.length || retryMembers.length) status = 'partial_failed';
+    else status = 'success';
+
+    const failureSummary = allFailures.slice(0, 3)
+      .map((f) => `${f.name || f.userId}：${f.reason}`)
+      .join('；');
+    if (status === 'success') {
+      // 只有全部候选都实际持久化成功，才推进整群成功时间并清空重试队列。
+      this.#markConsolidated(chatKey, successIds, { result: 'success' });
+    } else if (status === 'partial_failed') {
+      // 成功的人只更新个人时间；整群成功时间保持不变，失败的人进入持久化重试队列。
+      this.#markMembersConsolidated(successIds, at);
+      this.#markConsolidationAttempt(chatKey, {
+        at,
+        result: 'partial_failed',
+        error: failureSummary,
+        retryMembers
+      });
+    } else {
+      this.#markConsolidationAttempt(chatKey, {
+        at,
+        result: 'failed',
+        error: failureSummary || (this.aborted ? '整理被中断' : '没有写入任何印象'),
+        retryMembers
+      });
+    }
+    return {
+      ok: status === 'success',
+      status,
+      reason: status === 'success' ? undefined : status,
+      retryCount: retryMembers.length,
+      coldStart: !!coldStart,
+      note,
+      changed,
+      results,
+      skipped,
+      failed: allFailures
+    };
+  }
+
+  /**
+   * 计算下一次自动重试的成员队列（最多 20 人）：
+   * - 成功的成员移出队列；
+   * - 本轮失败/中断的成员累加尝试次数；
+   * - 重试轮里重新校验不合格的成员也移出队列。
+   */
+  #nextRetryMembers(priorRetry, retryOnly, results, failed, at = Date.now()) {
+    const map = new Map();
+    for (const item of Array.isArray(priorRetry) ? priorRetry : []) {
+      const userId = String(item?.userId || '').trim();
+      if (/^\d{1,15}$/.test(userId)) map.set(userId, { ...item, userId });
+    }
+    const succeeded = new Set(results.map((r) => String(r.userId || '').trim()).filter(Boolean));
+    for (const userId of succeeded) map.delete(userId);
+    for (const failure of failed) {
+      const userId = String(failure?.userId || '').trim();
+      if (!/^\d{1,15}$/.test(userId)) continue;
+      const prev = map.get(userId);
+      map.set(userId, {
+        userId,
+        name: String(failure.name || prev?.name || '').slice(0, 60),
+        reason: String(failure.reason || prev?.reason || '').slice(0, 120),
+        attempts: Math.max(1, Number(prev?.attempts) || 0) + (prev ? 1 : 0),
+        lastAttemptedAt: at
+      });
+    }
+    if (retryOnly) {
+      const handled = new Set([...succeeded, ...failed.map((f) => String(f.userId || ''))]);
+      for (const userId of retryOnly) if (!handled.has(userId)) map.delete(userId);
+    }
+    return [...map.values()].slice(0, 20);
+  }
+
+  /**
+   * 单个成员失败后立即把重试队列写入 _meta.json。
+   * 即使进程在批次中途崩溃，重启后也能按退避重试这些失败成员。
+   */
+  #persistRetryProgress(chatKey, priorRetry, retryOnly, results, failed) {
+    const retryMembers = this.#nextRetryMembers(priorRetry, retryOnly, results, failed, Date.now());
+    this.#markConsolidationAttempt(chatKey, {
+      result: 'running',
+      error: failed[failed.length - 1]?.reason || '',
+      retryMembers
+    });
   }
 
   /** 统计会话里各成员的出现次数与名字（用于身份识别与"新建印象"）。 */
@@ -1771,8 +2083,11 @@ export class Orchestrator {
     const nameToUserId = new Map();
     const uidToName = new Map();
     for (const m of this.store.recent(chatKey, { limit: 2000 })) {
+      // 只统计真实聊天消息：排除机器人、拍一拍/系统事件、匿名与占位 ID。
       if (m.self || !m.senderId) continue;
-      const uid = String(m.senderId);
+      if (m.eventKind && m.eventKind !== 'message') continue;
+      const uid = String(m.senderId).trim();
+      if (!/^\d{1,15}$/.test(uid) || UNRELIABLE_SENDER_IDS.has(uid)) continue;
       memberMsgCount.set(uid, (memberMsgCount.get(uid) || 0) + 1);
       const nm = String(m.senderName || '').trim();
       // 跳过占位名（历史脏数据：拍一拍事件曾把 senderName 写成"（拍一拍事件）"）
@@ -1841,13 +2156,59 @@ export class Orchestrator {
     return body + failNote + skippedNote;
   }
 
-  /** 记录整理时间，供冷却判断使用。 */
-  #markConsolidated(chatKey, userIds) {
+  /** 记录成功整理时间（仅在实际写入存储后调用）。 */
+  #markConsolidated(chatKey, userIds, details = {}) {
     const now = Date.now();
+    const result = details.result || 'success';
+    this.consolidationAttempts.set(chatKey, {
+      at: now,
+      result,
+      error: details.error || '',
+      retryMembers: [],
+      consecutiveFailures: result === 'success' ? 0 : 1
+    });
     try {
-      this.memory.markConsolidated(chatKey, now, userIds);
+      this.memory.markConsolidated(chatKey, now, userIds, details);
     } catch (error) {
       console.warn('[memory] 记录整理时间失败:', error?.message ?? error);
+    }
+  }
+
+  /** 只更新成功成员的个人整理时间，不推进整群成功状态。 */
+  #markMembersConsolidated(userIds, at = Date.now()) {
+    try {
+      if (typeof this.memory?.markMembersConsolidated === 'function') {
+        this.memory.markMembersConsolidated(userIds, at);
+      }
+    } catch (error) {
+      console.warn('[memory] 记录成员整理时间失败:', error?.message ?? error);
+    }
+  }
+
+  /**
+   * 记录一次整理尝试（running / no_targets / failed / partial_failed）。
+   * 持久化到 _meta.json；同时写一份内存兜底，保证元数据写失败时也不会每条消息重试。
+   */
+  #markConsolidationAttempt(chatKey, { at = Date.now(), result = '', error = '', retryMembers = undefined } = {}) {
+    const when = Number(at) || Date.now();
+    const outcome = String(result || 'unknown');
+    const previous = this.consolidationAttempts.get(chatKey);
+    const failed = outcome === 'failed' || outcome === 'partial_failed';
+    this.consolidationAttempts.set(chatKey, {
+      at: when,
+      result: outcome,
+      error: error || '',
+      retryMembers: Array.isArray(retryMembers) ? retryMembers : previous?.retryMembers,
+      consecutiveFailures: failed
+        ? Math.max(0, Number(previous?.consecutiveFailures) || 0) + 1
+        : Math.max(0, Number(previous?.consecutiveFailures) || 0)
+    });
+    try {
+      if (typeof this.memory?.markConsolidationAttempt === 'function') {
+        this.memory.markConsolidationAttempt(chatKey, { at: when, result: outcome, error, retryMembers });
+      }
+    } catch (error) {
+      console.warn('[memory] 记录整理尝试失败:', error?.message ?? error);
     }
   }
 
@@ -1862,6 +2223,10 @@ export class Orchestrator {
    * 而模型日常几乎不主动调 memory_append —— 没有这个入口就永远补不上。
    */
   async #consolidateOneMember(chatKey, mem, { force = false, stats = null } = {}) {
+    const userId = String(mem.userId || '').trim();
+    // 身份校验放在调用模型之前：没有有效 QQ 号既写不进全局人物记忆，
+    // 也不该白花一次模型请求。
+    if (!/^\d{1,15}$/.test(userId)) throw new Error('身份校验失败：缺少有效的 QQ 号');
     const existing = mem.impressions || [];
     const isNew = !!mem.isNew || (!existing.length && !!force);
 
@@ -1876,15 +2241,25 @@ export class Orchestrator {
     assertTimeAllowed();
 
     const parsed = extractJsonObject(String(res?.message?.content ?? ''));
-    if (!parsed) {
-      console.warn(`[memory] ${isNew ? '新建' : '整理'} ${chatKey}/${mem.userId || mem.name} 结果无法解析为 JSON，本轮放弃`);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      console.warn(`[memory] ${isNew ? '新建' : '整理'} ${chatKey}/${mem.userId || mem.name} 结果无法解析为 JSON 对象，本轮放弃`);
       if (process.env.QQ_AGENT_DEBUG_MEMORY) {
         console.warn('[memory][debug] 原始返回 =', JSON.stringify(String(res?.message?.content ?? '')).slice(0, 1500));
       }
       return null;
     }
+    // 严格校验：字段缺失/为 null/类型错误都不能降级成空数组，
+    // 否则一次格式异常就会清空已有长期印象。
+    if (!Array.isArray(parsed.impressions)) {
+      console.warn(`[memory] ${isNew ? '新建' : '整理'} ${chatKey}/${mem.userId || mem.name} 缺少 impressions 数组，本轮放弃`);
+      return null;
+    }
+    if (parsed.impressions.some((item) => typeof item !== 'string')) {
+      console.warn(`[memory] ${isNew ? '新建' : '整理'} ${chatKey}/${mem.userId || mem.name} impressions 元素类型错误，本轮放弃`);
+      return null;
+    }
 
-    const raw = Array.isArray(parsed.impressions) ? parsed.impressions : [];
+    const raw = parsed.impressions;
     const maxKeep = Number(getConfig().memory?.maxImpressionsPerMember) || 5;
 
     // 整理模式：条数变多 = 疑似幻觉，放弃（保留原印象）
@@ -1899,7 +2274,19 @@ export class Orchestrator {
       .slice(0, maxKeep)
       .map((content) => content.slice(0, 120));
 
-    return this.memory.replaceMember(chatKey, mem.userId, mem.name, clean);
+    // 非空数组却没有任何有效文本：视为格式/内容异常，不能当成“删除全部印象”。
+    if (raw.length && !clean.length) {
+      console.warn(`[memory] ${isNew ? '新建' : '整理'} ${chatKey}/${userId} impressions 没有有效文本，本轮放弃`);
+      return null;
+    }
+
+    // 新建模式却没提炼出任何稳定特征：不写入空印象，也不当成成功。
+    if (isNew && !clean.length) {
+      console.warn(`[memory] 新建 ${chatKey}/${userId} 没有提炼出可用印象，本轮放弃`);
+      return null;
+    }
+
+    return this.memory.replaceMember(chatKey, userId, mem.name, clean);
   }
 
   /** 整理模式：合并/删减已有印象。 */
@@ -1927,7 +2314,7 @@ export class Orchestrator {
     const maxKeep = Number(getConfig().memory?.maxImpressionsPerMember) || 5;
     const uid = String(mem.userId || '');
     const sample = (this.store.recent(chatKey, { limit: 2000 }) || [])
-      .filter((m) => !m.self && String(m.senderId) === uid)
+      .filter((m) => !m.self && (!m.eventKind || m.eventKind === 'message') && String(m.senderId) === uid)
       .slice(-40)
       .map((m) => String(m.text || '').slice(0, 200))
       .filter(Boolean);
@@ -2087,6 +2474,13 @@ const PLACEHOLDER_NAMES = new Set([
   '(拍一拍事件)',
   '未知',
   '某人'
+]);
+
+// 不可靠的发送者 ID：QQ 匿名消息和系统占位账号。
+// 这些 ID 会被多个匿名发言者共用，不能当作同一个可长期记忆的人物。
+const UNRELIABLE_SENDER_IDS = new Set([
+  '0',
+  '80000000'
 ]);
 
 /**

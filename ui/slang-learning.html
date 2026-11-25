@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>黑话学习 · QQ Agent</title>
+  <script>try{const t=localStorage.getItem('qqa-theme');document.documentElement.dataset.theme=t==='light'||t==='dark'?t:matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'}catch{}</script>
+  <link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/slang-learning.css">
+</head>
+<body class="slang-page">
+  <main class="sl-shell">
+    <header class="sl-header">
+      <div><a class="sl-back" href="/">← 返回控制台</a><div class="sl-title"><span class="sl-logo" aria-hidden="true">语</span><div><p class="sl-eyebrow">QQ AGENT / LEARNING</p><h1>黑话学习</h1></div></div><p class="sl-intro">从群聊发现新词，用来源验证含义，让每一次接梗都有依据。</p></div>
+      <div class="sl-header-actions"><span id="status" class="sl-badge" role="status">正在连接…</span><button id="refresh" type="button">↻ 刷新数据</button><span id="updated" class="sl-muted">尚未更新</span></div>
+    </header>
+    <div id="error" class="sl-notice sl-error" role="alert" hidden></div>
+    <div id="notice" class="sl-notice" role="status" hidden></div>
+    <section class="sl-stats" aria-label="学习概览">
+      <div class="sl-stat"><span>待发现与研究</span><strong id="stat-candidate">—</strong><small>候选词条</small></div>
+      <div class="sl-stat"><span>等待审核</span><strong id="stat-review">—</strong><small>核对释义后决定是否通过</small></div>
+      <div class="sl-stat"><span>后台任务</span><strong id="stat-queue">—</strong><small id="queue-note">读取队列状态…</small></div>
+      <div class="sl-stat"><span>需要关注</span><strong id="stat-attention">—</strong><small>失败或中断，可手动重试</small></div>
+    </section>
+    <details class="sl-panel sl-schedule" id="learning-plan">
+      <summary>自动学习计划<span class="sl-muted">点击配置频率、时段和数量限制</span></summary>
+      <p id="schedule-note" class="sl-plan-note" role="status">正在读取计划…</p>
+      <form id="settings" class="sl-form">
+        <label>授权群<input id="groups" placeholder="多个群号用逗号分隔" required><small>仅在已有访问权限的群内学习。保存仅更新本页学习参数。</small></label>
+        <div class="sl-plan-grid">
+          <fieldset><legend>① 从消息提取候选</legend>
+            <div class="sl-field-pair"><label>触发消息数<input id="min" type="number" min="2" max="50" required></label><label>提取最小间隔（分钟）<input id="extract-interval" type="number" min="1" max="1440" step="any" required></label></div>
+            <div class="sl-field-pair"><label>每次读取消息数<input id="extract-messages" type="number" min="2" max="50" required></label><label>每次最多候选数<input id="extract-candidates" type="number" min="1" max="20" required></label></div>
+            <label>每日最多提取次数<input id="extract-daily" type="number" min="0" max="10000" required></label>
+            <p class="sl-muted">消息达到触发数量且间隔满足后，才提取候选；不会无消息定时调用模型。每日次数填 0 表示不限。</p>
+          </fieldset>
+          <fieldset><legend>② 研究候选词条</legend>
+            <div class="sl-field-pair"><label>所需不同来源消息数<input id="threshold" type="number" min="1" max="20" required></label><label>批次最小间隔（分钟）<input id="research-interval" type="number" min="0" max="1440" step="any" required></label></div>
+            <div class="sl-field-pair"><label>每批最多研究词条数<input id="research-batch" type="number" min="1" max="5" required></label><label>每日最多研究次数<input id="research-daily" type="number" min="0" max="10000" required></label></div>
+            <p class="sl-muted">每批逐条研究，并发始终为 1。一次指一个词条启动研究，失败也计次；0 表示不限。批次间隔填 0 表示不额外等待。失败与中断不会自动重试，已导入候选不会仅因修改参数而自动重排。</p>
+          </fieldset>
+          <fieldset><legend>③ 允许启动的时段 · 北京时间</legend>
+            <div class="sl-field-pair"><label>开始<input id="schedule-start" type="time" required></label><label>结束<input id="schedule-end" type="time" required></label></div>
+            <p class="sl-muted">同时约束提取和研究。起止相同表示全天；结束早于开始表示跨午夜。在途任务继续到完成或超时，每日额度按北京时间零点重置。</p>
+          </fieldset>
+          <fieldset><legend>④ 单次任务时限</legend>
+            <label>提取 / 单词研究超时（秒）<input id="task-timeout" type="number" min="0" max="600" required></label>
+            <p class="sl-muted">填 0 沿用模型与搜索服务各自的超时设置。失败不阻塞聊天，不会自动降低来源校验要求。</p>
+          </fieldset>
+        </div>
+        <div class="sl-plan-save"><button class="sl-primary" type="submit">保存学习计划</button><span class="sl-muted">修改后立即应用；不会清空词库或审核记录。</span></div>
+      </form>
+    </details>
+    <section class="sl-panel sl-diagnostics"><h2>最近一次失败</h2><p id="failure-detail" class="sl-muted">正在读取诊断…</p></section>
+    <div class="sl-layout">
+      <section class="sl-panel sl-queue" aria-labelledby="queue-title">
+        <div class="sl-panel-heading"><div><h2 id="queue-title">候选与研究队列</h2><p>候选经审核通过后，才会用于回复。</p></div><span id="result-count" class="sl-count">加载中</span></div>
+        <div class="sl-toolbar"><label class="sl-search"><span class="sl-sr-only">搜索词条、释义、ID或会话</span><input id="search" type="search" placeholder="搜索词条、释义或群号…" autocomplete="off"></label><label><span class="sl-sr-only">按状态筛选</span><select id="filter"><option value="">全部状态</option><option value="pending_review">待审核</option><option value="candidate">候选</option><option value="queued">排队</option><option value="researching">研究中</option><option value="approved">已通过</option><option value="failed">失败</option><option value="interrupted">中断</option><option value="rejected">已驳回</option><option value="expired">已过期</option></select></label></div>
+        <div id="rows" class="sl-entries" aria-live="polite" aria-busy="true"><div class="sl-empty">正在读取词条…</div></div>
+        <footer class="sl-pagination"><span id="page-info" class="sl-muted"></span><div><button id="previous" type="button" disabled>上一页</button><button id="next" type="button" disabled>下一页</button></div></footer>
+      </section>
+      <aside class="sl-sidebar">
+        <section class="sl-panel sl-guide"><span class="sl-eyebrow">学习流程</span><h2>发现 → 研究 → 审核</h2><p>实时聊天优先，研究在后台进行。失败任务由你决定是否重试。</p><a href="/">已确认词条也可在控制台资产库维护 ↗</a></section>
+        <section class="sl-panel"><details><summary>词条纠错<span class="sl-muted">撤回并重新研究</span></summary><p class="sl-muted">撤回后保留旧版本和审计记录，重新研究与审核。</p><form id="withdraw" class="sl-form"><label>来源会话<input id="chat" placeholder="group:群号" required></label><label>词条 ID<input id="term-id" placeholder="输入已确认词条 ID" required></label><button class="sl-danger" type="submit">撤回词条</button></form></details></section>
+        <section class="sl-panel"><div class="sl-panel-heading"><h2>纠错反馈</h2><span class="sl-count" id="feedback-count">—</span></div><div id="feedback" class="sl-feedback"><p class="sl-muted">正在读取反馈…</p></div></section>
+      </aside>
+    </div>
+    <footer class="sl-footer">停用学习会保留全部数据。启用与固化可在控制台「实验功能」中管理。</footer>
+  </main>
+  <script src="/slang-learning-page.js"></script>
+</body></html>

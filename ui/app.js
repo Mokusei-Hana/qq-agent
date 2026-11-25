@@ -1090,7 +1090,12 @@ function connectSSE() {
       if (chatKey) state.consolidating[chatKey] = { startedAt: Date.now() };
     } else if (phase === 'consolidate-done') {
       if (chatKey) delete state.consolidating[chatKey];
-      if (chatKey) state.consolidateResult[chatKey] = { note: data.note || '整理完成', at: Date.now() };
+      if (chatKey) state.consolidateResult[chatKey] = {
+        note: data.note || '整理完成',
+        at: Date.now(),
+        failed: data.ok === false,
+        status: data.status || ''
+      };
     } else if (phase === 'consolidate-error') {
       if (chatKey) delete state.consolidating[chatKey];
       if (chatKey) {
@@ -3449,20 +3454,8 @@ async function loadMemoryView() {
     state.memoryFiles = files.files || [];
     state.chats = chats.chats || [];
     // 用后端状态校正本地记录：覆盖"页面刚刷新""SSE 断连期间状态变化"两种情况。
-    // 后端 consolidating 是唯一可信来源（它在 orchestrator 里真实维护）。
-    for (const f of state.memoryFiles) {
-      if (f.consolidating) {
-        if (!state.consolidating[f.chatKey]) {
-          state.consolidating[f.chatKey] = { startedAt: Date.now() };
-        }
-      } else if (state.consolidating[f.chatKey]) {
-        // 后端已经不在整理，说明完成了（结果由 SSE 事件补充）
-        delete state.consolidating[f.chatKey];
-        if (!state.consolidateResult[f.chatKey]) {
-          state.consolidateResult[f.chatKey] = { note: '整理完成', at: Date.now() };
-        }
-      }
-    }
+    // 后端 consolidating / consolidation 是唯一可信来源（它们在 orchestrator 里真实维护）。
+    window.QQAgentConsolidationStatus?.reconcileConsolidationState(state, state.memoryFiles);
     renderMemoryList();
     if (state.currentMemoryChatKey) loadMemoryDetail(state.currentMemoryChatKey);
   } catch (e) {
@@ -3473,18 +3466,59 @@ async function loadMemoryView() {
 
 // 整理中的计时刷新：让"已 Ns"持续走动，并在没有活跃任务时自动停掉。
 // 整理可能持续几十秒，用户切走再切回时靠它维持可见状态。
+// SSE 可能断线；停留本页时用低频轮询 /api/memory-files 校正状态。
 let consolidateTicker = null;
+let consolidationSyncAt = 0;
+let consolidationSyncFailures = 0;
+let consolidationSyncInFlight = false;
+
+async function syncConsolidationState({ force = false } = {}) {
+  if (consolidationSyncInFlight) return false;
+  if (document.hidden || state.tab !== 'memory') return false;
+  const helper = window.QQAgentConsolidationStatus;
+  const interval = helper?.nextPollDelay(consolidationSyncFailures) || 12000;
+  if (!force && Date.now() - consolidationSyncAt < interval) return false;
+  consolidationSyncInFlight = true;
+  try {
+    const data = await api('/api/memory-files');
+    consolidationSyncAt = Date.now();
+    consolidationSyncFailures = 0;
+    const files = Array.isArray(data.files) ? data.files : [];
+    state.memoryFiles = files;
+    const outcome = helper?.reconcileConsolidationState(state, files);
+    if (outcome?.completed) {
+      renderMemoryList();
+      if (state.currentMemoryChatKey) loadMemoryDetail(state.currentMemoryChatKey);
+      return true;
+    }
+    if (outcome?.changed) renderMemoryList();
+    return false;
+  } catch {
+    // 请求失败：指数退避，避免断网时高频轮询。
+    consolidationSyncFailures += 1;
+    consolidationSyncAt = Date.now();
+    return false;
+  } finally {
+    consolidationSyncInFlight = false;
+  }
+}
+
 function startConsolidateTicker() {
   if (consolidateTicker) return;
+  consolidationSyncAt = 0;
+  consolidationSyncFailures = 0;
   consolidateTicker = setInterval(() => {
     const active = Object.keys(state.consolidating);
     if (!active.length) {
       clearInterval(consolidateTicker);
       consolidateTicker = null;
+      consolidationSyncAt = 0;
+      consolidationSyncFailures = 0;
       if (state.tab === 'memory') renderMemoryList();
       return;
     }
-    if (state.tab !== 'memory') return;
+    // 离开记忆页或浏览器不可见时不发轮询请求；回来时 loadMemoryView 会重新校正。
+    if (state.tab !== 'memory' || document.hidden) return;
     // 只更新计时文本，不重建整个详情页（避免打断用户阅读/滚动）
     const key = state.currentMemoryChatKey;
     const el = $('#mem-consolidate-status');
@@ -3493,6 +3527,8 @@ function startConsolidateTicker() {
       el.textContent = `整理中…（已 ${sec}s）`;
     }
     renderMemoryList();
+    // 低频校正后端状态；in-flight 标志保证不会重复请求。
+    void syncConsolidationState();
   }, 1000);
 }
 
@@ -3612,7 +3648,8 @@ async function loadMemoryDetail(chatKey) {
     } else if (result) {
       const ago = Math.max(0, Math.round((Date.now() - (result.at || 0)) / 1000));
       const when = ago < 60 ? `${ago}s 前` : `${Math.round(ago / 60)} 分钟前`;
-      consolidateStatusHtml = `<span id="mem-consolidate-status" class="muted">${esc(result.note)}（${when}）</span>`;
+      const style = result.failed ? ' style="color:var(--color-text-danger,#e05a5a)"' : '';
+      consolidateStatusHtml = `<span id="mem-consolidate-status" class="muted"${style}>${esc(result.note)}（${when}）</span>`;
     } else {
       consolidateStatusHtml = `<span id="mem-consolidate-status" class="muted"></span>`;
     }
@@ -4615,7 +4652,7 @@ function renderSearchSection(c) {
         <option value="bocha" ${prov === 'bocha' ? 'selected' : ''}>博查 AI Search</option>
         <option value="baidu" ${prov === 'baidu' ? 'selected' : ''}>百度千帆 AI Search</option>
         <option value="metaso" ${prov === 'metaso' ? 'selected' : ''}>秘塔 AI 搜索</option>
-        ${customProvs.map((p) => `<option value="custom:${esc(p.id)}" ${prov === `custom:${p.id}` ? 'selected' : ''}>${esc(p.name || p.baseUrl)}（自定义 · ${p.type === 'bing' ? '网页解析' : 'JSON 接口'}）</option>`).join('')}
+        ${customProvs.map((p) => `<option value="custom:${esc(p.id)}" ${prov === `custom:${p.id}` ? 'selected' : ''}>${esc(p.name || p.baseUrl)}（自定义 · ${p.type === 'bing' ? '网页解析' : p.type === 'exa' ? 'Exa' : 'JSON 接口'}）</option>`).join('')}
       </select></div>
     <div class="field" id="custom-provider-manage" style="${prov.startsWith('custom:') ? '' : 'display:none'}">
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -4674,12 +4711,14 @@ function renderSearchSection(c) {
         <select id="new-sp-type">
           <option value="openai">JSON 搜索接口（POST）</option>
           <option value="bing">网页解析（Bing 结果格式）</option>
+          <option value="exa">Exa 搜索（api.exa.ai）</option>
         </select></div>
     </div>
     <div class="field"><label>接口地址 / 搜索页地址</label>
-      <input type="text" id="new-sp-baseurl" placeholder="JSON 类型：https://your-search.example.com/search；网页类型：https://your-searx.example.com/search" style="width:100%" /></div>
+      <input type="text" id="new-sp-baseurl" placeholder="JSON 类型：https://your-search.example.com/search；网页类型：https://your-searx.example.com/search；Exa：https://api.exa.ai/search" style="width:100%" /></div>
+    <div class="hint" id="new-sp-type-hint"></div>
     <div class="field-row">
-      <div class="field"><label>API Key（可选）</label>
+      <div class="field"><label id="new-sp-apikey-label">API Key（可选）</label>
         <input type="password" id="new-sp-apikey" placeholder="多数自建服务留空即可" autocomplete="new-password" style="width:100%" /></div>
       <div class="field"><label>模型名（可选）</label>
         <input type="text" id="new-sp-model" placeholder="Responses API 风格才需要" /></div>
@@ -6871,6 +6910,39 @@ function bindSettingsEvents(c) {
   });
 
   // ── 自定义搜索服务：添加 / 测试 / 删除 ──
+  // 类型切换时给出对应默认地址提示（Exa 直接填官方端点，省得用户记）
+  const EXA_ENDPOINT = 'https://api.exa.ai/search';
+  let autoFilledBaseUrl = '';
+  const syncSearchTypeHint = () => {
+    const type = $('#new-sp-type')?.value || 'openai';
+    const hint = $('#new-sp-type-hint');
+    const baseInput = $('#new-sp-baseurl');
+    const keyInput = $('#new-sp-apikey');
+    const keyLabel = $('#new-sp-apikey-label');
+    if (type === 'exa') {
+      if (hint) hint.textContent = 'Exa：接口地址填 https://api.exa.ai/search，API Key 用 Exa 控制台生成的密钥（认证头为 x-api-key），模型名留空。';
+      // 只在用户没自己填过的时候预填，且记下来，切走时清掉，避免把 Exa 地址留念到别的类型
+      if (baseInput && !baseInput.value.trim()) {
+        baseInput.value = EXA_ENDPOINT;
+        autoFilledBaseUrl = EXA_ENDPOINT;
+      }
+      if (baseInput) baseInput.placeholder = EXA_ENDPOINT;
+      if (keyInput) keyInput.placeholder = 'Exa API Key（必填）';
+      if (keyLabel) keyLabel.textContent = 'API Key（Exa 必填）';
+    } else {
+      if (hint) hint.textContent = '';
+      // 只回收我们自动填进去的值，用户手填的不动
+      if (baseInput && autoFilledBaseUrl && baseInput.value.trim() === autoFilledBaseUrl) {
+        baseInput.value = '';
+      }
+      autoFilledBaseUrl = '';
+      if (baseInput) baseInput.placeholder = 'JSON 类型：https://your-search.example.com/search；网页类型：https://your-searx.example.com/search';
+      if (keyInput) keyInput.placeholder = '多数自建服务留空即可';
+      if (keyLabel) keyLabel.textContent = 'API Key（可选）';
+    }
+  };
+  $('#new-sp-type')?.addEventListener('change', syncSearchTypeHint);
+
   $('#add-search-provider-btn')?.addEventListener('click', async () => {
     const hint = $('#add-search-provider-hint');
     const baseUrl = ($('#new-sp-baseurl')?.value || '').trim();

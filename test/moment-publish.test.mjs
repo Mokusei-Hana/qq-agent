@@ -104,6 +104,26 @@ test('malformed JSON is returned as a tool error, then a corrected decision publ
   assert.equal(f.sends.length, 1);
 });
 
+test('NapCat without the Qzone bridge fails with a configuration hint instead of an unsupported API call', async () => {
+  const actions = [];
+  const f = fixture({
+    onebot: {
+      selfId: '888',
+      appName: 'NapCat.Onebot',
+      call: async (action) => {
+        actions.push(action);
+        assert.fail(`不应调用 ${action}`);
+      }
+    }
+  });
+  await assert.rejects(
+    () => f.manager.run({ dayKey, publish: true, source: 'manual-publish' }),
+    (error) => error?.code === 'MOMENT_QZONE_BRIDGE_REQUIRED'
+      && /qzoneBridge/.test(error.message)
+  );
+  assert.equal(actions.some((action) => /qzone/.test(action)), false);
+});
+
 test('all decision rounds use auto tool choice for thinking-mode compatibility', async () => {
   const toolChoices = [];
   const f = fixture({ complete: async ({ toolChoice }) => {

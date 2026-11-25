@@ -7,8 +7,6 @@
     style.id = 'session-memory-style';
     style.textContent = `
       #view-memory #mem-add-imp-btn,
-      #view-memory #mem-consolidate-btn,
-      #view-memory #mem-consolidate-status,
       #view-memory #mem-load-members-btn,
       #view-memory #mem-members,
       #view-memory #memory-detail > .collapsible:not(.memory-handoff) {
@@ -70,7 +68,7 @@
     if (header && handoff && !detail.querySelector('.session-memory-note')) {
       const note = document.createElement('div');
       note.className = 'session-memory-note';
-      note.textContent = '人物长期记忆已独立到“人物记忆”页；本页只管理当前群聊/私聊自己的会话交接状态。';
+      note.textContent = '本页可以整理当前群的长期人物印象；人物印象明细请在“人物记忆”页查看。会话交接仍在本页单独管理。';
       header.insertAdjacentElement('afterend', note);
     }
 

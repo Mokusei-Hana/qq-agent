@@ -10,6 +10,11 @@ export function normalizeBehaviorProfile(value) {
 // 已把其中旧架构专属指令（[SILENT]、qq_* MCP 工具名、唤醒配置、空格分条等）
 // 适配为本程序的机制（安静结束、send_message 数组分条、原生工具名），人格与示例原样保留。
 export const PERSONAS = {
+  xiaojingyuQqV2: {
+    name: '小鲸鱼（QQ 群友二代）',
+    behaviorProfile: 'grounded',
+    text: readFileSync(new URL('../roles/xiaojingyu-qq-v2.md', import.meta.url), 'utf8').trim()
+  },
   xiaojingyu: {
     name: '小鲸鱼（默认）',
     behaviorProfile: 'legacy',

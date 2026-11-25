@@ -216,6 +216,7 @@ export class ChatStore {
 
   getChatMeta(chatKey) {
     const counts = this.db.prepare(`SELECT COUNT(*) AS total,
+      COALESCE(SUM(self=0 AND event_kind='message'),0) AS incomingCount,
       COALESCE(SUM(state IN ('pending','leased')),0) AS unread,
       COALESCE(SUM(state='failed'),0) AS failed,
       COALESCE(SUM(state='held'),0) AS heldMessages FROM messages WHERE chat_key=?`).get(chatKey);
@@ -248,6 +249,13 @@ export class ChatStore {
   unreadCount(chatKey) {
     return this.db.prepare(`SELECT COUNT(*) AS n FROM messages WHERE chat_key=? AND self=0
       AND state='pending' AND available_at<=?`).get(chatKey, Date.now()).n;
+  }
+
+  /** 最近一条真人聊天消息的时间；排除机器人消息和拍一拍等非普通事件。 */
+  lastIncomingTs(chatKey) {
+    const row = this.db.prepare(`SELECT MAX(ts) AS ts FROM messages
+      WHERE chat_key=? AND self=0 AND event_kind='message'`).get(chatKey);
+    return Number(row?.ts) || 0;
   }
 
   peekUnread(chatKey, limit = 3) {
@@ -299,17 +307,20 @@ export class ChatStore {
     return messages;
   }
 
-  claimUnread(chatKey, { limit = 100, maxChars = 32000, leaseMs = 240000 } = {}) {
+  claimUnread(chatKey, { limit = 100, maxChars = 32000, leaseMs = 240000, isolateMessage = null } = {}) {
     return this.#transaction(() => {
       if (this.db.prepare("SELECT 1 FROM runs WHERE chat_key=? AND state='leased'").get(chatKey)) return null;
       const pending = this.peekUnread(chatKey, Math.min(100, Math.max(1, limit)));
       const messages = [];
       let chars = 0;
       for (const m of pending) {
+        // Preserve order and leave all other messages pending for later leases.
+        if (messages.length && isolateMessage?.(m)) break;
         const length = Math.min(m.text.length, 2000) + 100;
         if (messages.length && chars + length > maxChars) break;
         messages.push({ ...m, text: m.text.length > 2000 ? `${m.text.slice(0, 2000)} [truncated; use get_message_detail]` : m.text });
         chars += length;
+        if (isolateMessage?.(m)) break;
       }
       if (!messages.length) return null;
       const id = crypto.randomUUID();
@@ -474,7 +485,7 @@ export class ChatStore {
     }
     if (!transitions.length) return 0;
     // #region debug-point C:thread-expiry-transition
-    for (const { row, nextState, reason } of transitions) (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'C', location: 'src/store.js:expireConversationThreads', msg: '[DEBUG] Conversation thread expired or rolled over', data: { chatKey: row.chat_key, threadId: row.thread_id, previousState: row.state, disposition: row.disposition, nextState, reason, now, idleDeadline: Number(row.idle_deadline) || 0, hardDeadline: Number(row.hard_deadline) || 0, resumeArmedUntil: Number(row.resume_armed_until) || 0 }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
+    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') for (const { row, nextState, reason } of transitions) (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'C', location: 'src/store.js:expireConversationThreads', msg: '[DEBUG] Conversation thread expired or rolled over', data: { chatKey: row.chat_key, threadId: row.thread_id, previousState: row.state, disposition: row.disposition, nextState, reason, now, idleDeadline: Number(row.idle_deadline) || 0, hardDeadline: Number(row.hard_deadline) || 0, resumeArmedUntil: Number(row.resume_armed_until) || 0 }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
     // #endregion
     this.#transaction(() => {
       for (const { row, nextState, reason } of transitions) {
@@ -606,7 +617,7 @@ export class ChatStore {
         ? (activeAtHardDeadline ? 'rollover_armed' : 'closed')
         : normalizedDisposition;
       // #region debug-point C:lifecycle-deadline-calculation
-      (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'C', location: 'src/store.js:updateLifecycleThread', msg: '[DEBUG] Lifecycle deadlines calculated', data: { chatKey, currentThreadId: current?.threadId || null, currentState: current?.state || null, currentDisposition: current?.disposition || null, reusable, acceptedTime, now, normalizedDisposition, idleDeadline, hardDeadline, resumeArmedUntil, activeAtHardDeadline, nextState: state }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
+      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'C', location: 'src/store.js:updateLifecycleThread', msg: '[DEBUG] Lifecycle deadlines calculated', data: { chatKey, currentThreadId: current?.threadId || null, currentState: current?.state || null, currentDisposition: current?.disposition || null, reusable, acceptedTime, now, normalizedDisposition, idleDeadline, hardDeadline, resumeArmedUntil, activeAtHardDeadline, nextState: state }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
       // #endregion
       const participants = [...new Set([
         ...(reusable ? current.participantIds : []),

@@ -1,5 +1,6 @@
 // 配置管理：data/config.json，UI 可写。所有字段都有默认值。
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PERSONAS, normalizeBehaviorProfile } from './personas.js';
@@ -92,16 +93,17 @@ export const DEFAULT_CONFIG = {
     },
     // 自定义搜索提供商列表（设置页可像添加模型提供商一样自行添加，可多个）。
     // 每项：{ id, name, type, baseUrl, apiKey, model, count, timeoutMs }
-    // type: 'openai' = POST JSON 搜索接口；'bing' = GET 页面并按 b_algo 解析
+    // type: 'openai' = POST JSON 搜索接口；'bing' = GET 页面并按 b_algo 解析；
+    //       'exa' = Exa Search API（认证头是 x-api-key，不是 Bearer）
     // 在「搜索提供方」下拉框里以 custom:<id> 的形式出现
     providers: [],
     // 自定义搜索服务（旧的单槽位，保留以兼容；新添加的建议用上面的 providers 数组）
     custom: {
       name: '',                       // 展示名，如"我的 SearXNG"
-      type: 'openai',                 // 'openai' = OpenAI 风格的 JSON 搜索 API；'bing' = 抓 HTML 解析 b_algo
-      baseUrl: '',                    // openai: 搜索端点；bing: 搜索页地址
-      apiKey: '',                     // openai 类型需要（可选，视服务而定）
-      model: '',                      // openai 类型可选： Responses API 风格的模型名
+      type: 'openai',                 // 'openai' JSON 搜索 API | 'bing' 抓 HTML 解析 b_algo | 'exa' Exa Search API
+      baseUrl: '',                    // openai: 搜索端点；bing: 搜索页地址；exa: 默认 https://api.exa.ai/search
+      apiKey: '',                     // openai / exa 类型需要（exa 也可用环境变量 EXA_API_KEY）
+      model: '',                      // openai 类型可选： Responses API 风格的模型名（exa 留空）
       count: 6,
       timeoutMs: 20000
     }
@@ -116,6 +118,14 @@ export const DEFAULT_CONFIG = {
     httpUrl: 'http://127.0.0.1:3000',
     accessToken: '',           // WebSocket 令牌
     httpAccessToken: ''        // HTTP API 令牌（SnowLuma 可与 WS 不同；留空沿用 accessToken）
+  },
+  // QQ 空间扩展动作由独立的 onebot-qzone 桥接提供。
+  // 协议端换成 NapCat 后没有 get_qzone_msg_list 等接口，启用此项后每日动态和动态互动改走桥接。
+  qzoneBridge: {
+    enabled: false,
+    baseUrl: 'http://127.0.0.1:5700',
+    accessToken: '',
+    timeoutMs: 30000
   },
   // 人设与行为
   persona: {
@@ -430,14 +440,65 @@ function deepMerge(base, override) {
   return out;
 }
 
+// A failed read permanently blocks this process from persisting cached/runtime
+// state. Repair the file and restart instead of risking a destructive retry.
+let configWriteError = null;
+
+function readStoredConfig() {
+  let text = fs.readFileSync(CONFIG_FILE, 'utf8');
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  const parsed = JSON.parse(text);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Configuration must be a JSON object');
+  }
+  return parsed;
+}
+
+function blockConfigWrites(error) {
+  configWriteError ||= new Error(`Cannot safely access configuration: ${CONFIG_FILE}`, { cause: error });
+  throw configWriteError;
+}
+
 export function loadConfig() {
   try {
-    let text = fs.readFileSync(CONFIG_FILE, 'utf8');
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    const parsed = migrateConfig(JSON.parse(text));
+    const parsed = migrateConfig(readStoredConfig());
     return deepMerge(DEFAULT_CONFIG, parsed);
-  } catch {
-    return structuredClone(DEFAULT_CONFIG);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return structuredClone(DEFAULT_CONFIG);
+    blockConfigWrites(error);
+  }
+}
+
+function assertConfigWritable(config) {
+  if (configWriteError) throw configWriteError;
+  let stored;
+  try {
+    stored = readStoredConfig();
+    const stat = fs.statSync(CONFIG_FILE);
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+      throw new Error('Configuration owner differs from process user; run as the service user');
+    }
+    fs.chmodSync(CONFIG_FILE, 0o600);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') blockConfigWrites(error);
+  }
+  if (stored?.onebot?.accessToken && stored?.api?.model
+    && !String(config?.onebot?.accessToken || '').trim()
+    && !String(config?.api?.model || '').trim()) {
+    throw new Error('Refusing to overwrite configured OneBot token and model with empty values');
+  }
+}
+
+function persistConfig(config) {
+  assertConfigWritable(config);
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+  // Exclusive creation avoids reusing a stale or differently owned temp file.
+  const tmp = `${CONFIG_FILE}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600, flag: 'wx' });
+    fs.renameSync(tmp, CONFIG_FILE);
+  } finally {
+    fs.rmSync(tmp, { force: true });
   }
 }
 
@@ -503,6 +564,7 @@ export function relationshipV2Enabled(cfg = getConfig()) {
 
 /** 更新并持久化配置（浅合并到当前值；patch 里传对象字段则整体替换该字段）。 */
 export function updateConfig(patch) {
+  if (configWriteError) throw configWriteError;
   const next = migrateConfig(deepMerge(getConfig(), patch));
   const oldTimeControl = JSON.stringify(getConfig().timeControl);
   next.persona.behaviorProfile = normalizeBehaviorProfile(next.persona.behaviorProfile);
@@ -830,22 +892,19 @@ export function updateConfig(patch) {
   if (!['127.0.0.1', 'localhost', '::1'].includes(next.server.host) && !String(next.server.token || '').trim()) {
     throw new Error('A console token is required for LAN access');
   }
-  currentConfig = next;
 
   // ── 响应档位：以滑条位置为唯一真相，派生 tier 与随机概率 ──
   // 前端只负责上报滑条位置（contextSliderPos），档位和概率一律由这里换算。
   // 这样即使前端算错、或者有人直接调接口只传位置，配置也不会自相矛盾。
-  const posRaw = currentConfig?.store?.contextSliderPos;
+  const posRaw = next?.store?.contextSliderPos;
   if (posRaw !== undefined && posRaw !== null) {
     const { tier, randomPercent } = sliderToTier(posRaw);
-    currentConfig.store.contextTier = tier;
-    currentConfig.store.randomPercent = randomPercent;
+    next.store.contextTier = tier;
+    next.store.randomPercent = randomPercent;
   }
 
-  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-  const tmp = `${CONFIG_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(currentConfig, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, CONFIG_FILE);
+  persistConfig(next);
+  currentConfig = next;
   if (oldTimeControl !== JSON.stringify(next.timeControl)) notifyTimeControlChange();
   return currentConfig;
 }
@@ -887,13 +946,11 @@ export function conversationConfigForChat(chatKey) {
 
 /** 防抖保存：高频小改动合并写盘。 */
 export function scheduleConfigSave() {
+  assertConfigWritable(getConfig());
   clearTimeout(saveTimers.get('cfg'));
   saveTimers.set('cfg', setTimeout(() => {
     try {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-      const tmp = `${CONFIG_FILE}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(getConfig(), null, 2), 'utf8');
-      fs.renameSync(tmp, CONFIG_FILE);
+      persistConfig(getConfig());
     } catch (error) {
       console.error('[config] 保存失败:', error);
     }

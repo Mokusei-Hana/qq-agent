@@ -26,6 +26,7 @@ import {
   shanghaiDayStart,
   todayKey
 } from './util.js';
+import { onebotNeedsQzoneBridge, qzoneBridgeRequiredMessage } from './qzone-bridge.js';
 
 const STATE_FILE = path.join(DATA_DIR, 'daily-moments.json');
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -228,6 +229,7 @@ export class DailyMomentsManager {
     onebot,
     sessions = null,
     resolveChatName = async () => '',
+    qzone = null,
     emit = null,
     complete = chatCompletionWithRetry,
     search = webSearch,
@@ -244,6 +246,7 @@ export class DailyMomentsManager {
     this.memory = memory;
     this.stickers = stickers;
     this.onebot = onebot;
+    this.qzone = qzone;
     this.sessions = sessions;
     this.resolveChatName = resolveChatName;
     this.emit = typeof emit === 'function' ? emit : () => {};
@@ -520,7 +523,7 @@ export class DailyMomentsManager {
       dayKey, source, scheduleSlotId: scheduleSlot?.id || ''
     }, !automatic);
     // #region debug-point B:moment-publish-gate
-    if (!process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'daily-moment-publish', runId: process.env.QQ_MOMENT_DEBUG_RUN || 'post-fix', hypothesisId: 'B', location: 'daily-moments:#run', msg: '[DEBUG] Publication gate evaluated', data: { dayKey, publish, force, priorId: previous?.id || null, priorStatus: previous?.status || null, priorSource: previous?.source || null }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_MOMENT_DEBUG_URL || 'http://192.168.31.10:7780/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'daily-moment-publish', runId: process.env.QQ_MOMENT_DEBUG_RUN || 'post-fix', hypothesisId: 'B', location: 'daily-moments:#run', msg: '[DEBUG] Publication gate evaluated', data: { dayKey, publish, force, priorId: previous?.id || null, priorStatus: previous?.status || null, priorSource: previous?.source || null }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_MOMENT_DEBUG_URL || 'http://192.168.31.10:7780/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
     // #endregion
     if (previous && publish && force && !confirmDuplicateRisk) {
       throw momentError(
@@ -566,7 +569,7 @@ export class DailyMomentsManager {
     };
     this.#saveRecord(record);
     // #region debug-point A-C:daily-run-start
-    if (!String(process.argv[1]).includes('/test/')) (() => { try { const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,C', location: 'src/daily-moments.js:#run', msg: '[DEBUG] Daily summary run started', data: { recordId: record.id, dayKey, source, publish, startedAt: record.startedAt }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
+    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!String(process.argv[1]).includes('/test/')) (() => { try { const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,C', location: 'src/daily-moments.js:#run', msg: '[DEBUG] Daily summary run started', data: { recordId: record.id, dayKey, source, publish, startedAt: record.startedAt }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
     // #endregion
     this.controller = new AbortController();
     const releaseTimeGuard = watchTimeWindow((error) => this.controller?.abort(error), '');
@@ -1007,7 +1010,7 @@ export class DailyMomentsManager {
     const defs = this.#toolDefs(context);
     const tools = openAiTools(defs);
     // #region debug-point B-D:daily-prompt-tools
-    if (!String(process.argv[1]).includes('/test/')) (() => { try { const roleText = String(rootConfig.persona?.roleText || ''); const customRules = String(rootConfig.persona?.customRules || ''); const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'B,D', location: 'src/daily-moments.js:#decide', msg: '[DEBUG] Daily prompt and tool surface prepared', data: { toolNames: defs.map((def) => def.name), systemPromptChars: systemPrompt.length, roleTextChars: roleText.length, customRulesChars: customRules.length, roleTextInjected: roleText ? systemPrompt.includes(roleText) : false, customRulesInjected: customRules ? systemPrompt.includes(customRules) : false }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
+    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!String(process.argv[1]).includes('/test/')) (() => { try { const roleText = String(rootConfig.persona?.roleText || ''); const customRules = String(rootConfig.persona?.customRules || ''); const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'B,D', location: 'src/daily-moments.js:#decide', msg: '[DEBUG] Daily prompt and tool surface prepared', data: { toolNames: defs.map((def) => def.name), systemPromptChars: systemPrompt.length, roleTextChars: roleText.length, customRulesChars: customRules.length, roleTextInjected: roleText ? systemPrompt.includes(roleText) : false, customRulesInjected: customRules ? systemPrompt.includes(customRules) : false }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
     // #endregion
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -1110,7 +1113,7 @@ export class DailyMomentsManager {
           parseError = '工具参数不是合法 JSON 对象。请按工具 schema 重新提交，字符串内双引号必须转义；不要把正文或摘要包成未转义的引号。';
         }
         // #region debug-point A:moment-submit-arguments
-        if (name === 'submit_daily_moment' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'daily-moment-publish', runId: process.env.QQ_MOMENT_DEBUG_RUN || 'post-fix', hypothesisId: 'A', location: 'daily-moments:#decide', msg: '[DEBUG] Submission arguments decoded', data: { rawType: typeof call?.function?.arguments, rawChars: String(call?.function?.arguments || '').length, parsedKeys: Object.keys(args || {}), decision: args?.decision ?? null }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_MOMENT_DEBUG_URL || 'http://192.168.31.10:7780/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+        if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (name === 'submit_daily_moment' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'daily-moment-publish', runId: process.env.QQ_MOMENT_DEBUG_RUN || 'post-fix', hypothesisId: 'A', location: 'daily-moments:#decide', msg: '[DEBUG] Submission arguments decoded', data: { rawType: typeof call?.function?.arguments, rawChars: String(call?.function?.arguments || '').length, parsedKeys: Object.keys(args || {}), decision: args?.decision ?? null }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_MOMENT_DEBUG_URL || 'http://192.168.31.10:7780/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
         // #endregion
         const def = defs.find((item) => item.name === name);
         let result;
@@ -1295,7 +1298,7 @@ export class DailyMomentsManager {
           }
           context.finalDecision = decision;
           // #region debug-point A:moment-submit-decision
-          if (!process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'daily-moment-publish', runId: process.env.QQ_MOMENT_DEBUG_RUN || 'post-fix', hypothesisId: 'A', location: 'daily-moments:submit', msg: '[DEBUG] Submission normalized', data: { decision: context.finalDecision.decision, reasonChars: context.finalDecision.reason.length, contentChars: context.finalDecision.content.length }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_MOMENT_DEBUG_URL || 'http://192.168.31.10:7780/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+          if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'daily-moment-publish', runId: process.env.QQ_MOMENT_DEBUG_RUN || 'post-fix', hypothesisId: 'A', location: 'daily-moments:submit', msg: '[DEBUG] Submission normalized', data: { decision: context.finalDecision.decision, reasonChars: context.finalDecision.reason.length, contentChars: context.finalDecision.content.length }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_MOMENT_DEBUG_URL || 'http://192.168.31.10:7780/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
           // #endregion
           return { content: JSON.stringify({ accepted: true, decision: context.finalDecision.decision }) };
         }
@@ -1337,6 +1340,18 @@ export class DailyMomentsManager {
     if (candidate.prepared) return candidate.prepared;
     const source = await this.#resolveImageSource(snapshot, imageId);
     if (!source) return null;
+    // 表情本地化后返回的是 base64://，不需要（也不能）走 URL 校验和下载。
+    if (source.startsWith('base64://')) {
+      const localBuffer = Buffer.from(source.slice('base64://'.length), 'base64');
+      if (!localBuffer.length) throw new Error(`候选图片 ${imageId} 内容为空`);
+      const mime = imageMime(localBuffer, '');
+      const encoded = localBuffer.toString('base64');
+      candidate.prepared = {
+        dataUrl: `data:${mime};base64,${encoded}`,
+        uploadSource: `base64://${encoded}`
+      };
+      return candidate.prepared;
+    }
     const safeUrl = await this.validateImage(source);
     const { buffer, contentType } = await this.fetchBinary(
       safeUrl,
@@ -1354,9 +1369,19 @@ export class DailyMomentsManager {
   }
 
   async #findDuplicate(content, signal) {
-    const data = typeof this.onebot.getQzoneMoments === 'function'
-      ? await this.onebot.getQzoneMoments({ num: 30, signal })
-      : await this.onebot.call('get_qzone_msg_list', { pos: 0, num: 30 }, 30000, signal);
+    const qzone = this.qzone?.enabled ? this.qzone : null;
+    if (!qzone && onebotNeedsQzoneBridge(this.onebot)) {
+      throw momentError(
+        'MOMENT_QZONE_BRIDGE_REQUIRED',
+        qzoneBridgeRequiredMessage(this.onebot, '读取空间列表核对重复内容'),
+        503
+      );
+    }
+    const data = qzone
+      ? await qzone.getMoments({ num: 30, signal })
+      : (typeof this.onebot.getQzoneMoments === 'function'
+        ? await this.onebot.getQzoneMoments({ num: 30, signal })
+        : await this.onebot.call('get_qzone_msg_list', { pos: 0, num: 30 }, 30000, signal));
     if (!Array.isArray(data?.msglist)) {
       throw momentError('MOMENT_CHECK_FAILED', '无法读取空间列表核对重复内容，本次未发起发布', 502);
     }
@@ -1367,8 +1392,17 @@ export class DailyMomentsManager {
 
   async #publishMoment(content, images, cfg, signal) {
     // #region debug-point D:moment-qzone-dispatch
-    if (!process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'daily-moment-publish', runId: process.env.QQ_MOMENT_DEBUG_RUN || 'post-fix', hypothesisId: 'D', location: 'daily-moments:#publishMoment', msg: '[DEBUG] Qzone publish dispatch', data: { contentChars: content.length, imageCount: images.length, visibility: cfg.visibility }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_MOMENT_DEBUG_URL || 'http://192.168.31.10:7780/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
+    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'daily-moment-publish', runId: process.env.QQ_MOMENT_DEBUG_RUN || 'post-fix', hypothesisId: 'D', location: 'daily-moments:#publishMoment', msg: '[DEBUG] Qzone publish dispatch', data: { contentChars: content.length, imageCount: images.length, visibility: cfg.visibility }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_MOMENT_DEBUG_URL || 'http://192.168.31.10:7780/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
     // #endregion
+    const qzone = this.qzone?.enabled ? this.qzone : null;
+    if (qzone) {
+      return qzone.publishMoment(content, {
+        images,
+        ugcRight: cfg.visibility,
+        targetUins: cfg.targetUins,
+        signal
+      });
+    }
     if (typeof this.onebot.sendQzoneMoment === 'function') {
       return this.onebot.sendQzoneMoment(content, {
         images,
@@ -1376,6 +1410,13 @@ export class DailyMomentsManager {
         targetUins: cfg.targetUins,
         signal
       });
+    }
+    if (onebotNeedsQzoneBridge(this.onebot)) {
+      throw momentError(
+        'MOMENT_QZONE_BRIDGE_REQUIRED',
+        qzoneBridgeRequiredMessage(this.onebot, '发布说说'),
+        503
+      );
     }
     const params = {
       content,

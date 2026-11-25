@@ -160,6 +160,11 @@ export async function chatCompletion({
     body.tools = tools;
     body.tool_choice = toolChoice;
   }
+  if (process.env.QQ_AGENT_TOOL_DEBUG === '1') {
+    console.info('[tools] model request', JSON.stringify({
+      names: (body.tools || []).map((tool) => tool.function?.name)
+    }));
+  }
   const temp = temperature === null ? (api.temperature ?? 0.8) : temperature;
   if (temp !== null && temp !== undefined && Number.isFinite(Number(temp))) body.temperature = Number(temp);
   if (Number.isFinite(Number(maxTokens)) && Number(maxTokens) > 0) {
@@ -199,6 +204,12 @@ export async function chatCompletion({
     const data = await res.json();
     const choice = data?.choices?.[0];
     if (!choice) throw new Error('模型 API 响应缺少 choices');
+    if (process.env.QQ_AGENT_TOOL_DEBUG === '1') {
+      console.info('[tools] model response', JSON.stringify({
+        names: (choice.message?.tool_calls || []).map((call) => call.function?.name)
+          .filter((name) => (tools || []).some((tool) => tool.function?.name === name))
+      }));
+    }
     return {
       message: choice.message ?? {}, finishReason: choice.finish_reason ?? null,
       usage: data.usage ?? null, model: data.model ?? api.model, raw: data

@@ -15,6 +15,7 @@ import { SessionRegistry } from './sessions.js';
 import { Orchestrator } from './orchestrator.js';
 import { DailyMomentsManager } from './daily-moments.js';
 import { QzoneInteractionManager } from './qzone-interactions.js';
+import { QzoneBridgeClient } from './qzone-bridge.js';
 import { listModels, chatCompletion, resolveApiKey, cachedTokensOfUsage } from './llm.js';
 import { resolveOfficialPrice, listOfficialPrices, isPeakHour, priceAt, resolveModelPrice, modelLabel, splitModelLabel, UNKNOWN_VENDOR } from './model-prices.js';
 import { initPriceFeed, refreshPriceFeed, priceFeedStatus } from './price-feed.js';
@@ -22,7 +23,11 @@ import { currentProviders, setProviderKey, testAllProviders, testOneProvider, te
 import { scanModelsVision, visionResults, modelImageVerdict } from './vision-scan.js';
 import { builtinVisionResults } from './model-vision-docs.js';
 import { createEventBus, todayKey, shanghaiDayStart } from './util.js';
-import { assertCanSend } from './access.js';
+import { assertCanSend, chatAllowed, canRun } from './access.js';
+import { SlangLearning, slangLearningSettings } from './slang-learning.js';
+import { PersonalityLearning } from './personality-learning.js';
+import { extractSlang, researchSlang } from './slang-learning-research.js';
+import { BridgeReceiptGuard } from './return-context.js';
 import { isTimeActive } from './time-gate.js';
 import { timeControlState, TIME_ZONE } from './time-control.js';
 import { IdentityPilotManager, inactiveIdentityPilotStatus } from './identity-pilot.js';
@@ -75,6 +80,61 @@ function decodeImageDataUrl(value) {
   if (!buffer.length) throw new Error('图片内容为空');
   if (buffer.length > 8 * 1024 * 1024) throw new Error('表情图片不能超过 8 MiB');
   return buffer;
+}
+
+/**
+ * 把整理异常转换成可以安全发给前端的简短原因。
+ * 不返回原始 message，避免模型 HTTP 响应、路径或密钥片段进入控制台。
+ */
+export function safeConsolidationError(error) {
+  const text = String(error?.message ?? error ?? '');
+  if (/模型未配置/.test(text)) return '模型未配置，无法整理记忆';
+  if (/非活跃时间|TIME_CONTROL_INACTIVE/.test(text)) return '当前不在允许调用模型的时间段';
+  if (/超时|timeout|timed out/i.test(text)) return '模型请求超时，请稍后重试';
+  if (/模型 API HTTP|模型请求失败/.test(text)) return '模型服务暂时不可用，请稍后重试';
+  return '整理过程中发生错误，请稍后重试';
+}
+
+/**
+ * 手动整理完成后的前端事件语义。只暴露状态、数量和提示，
+ * 不把原始 failed 原因、异常堆栈或聊天内容发给浏览器。
+ */
+export function buildConsolidationUpdate(result) {
+  const status = String(result?.status || (result?.ok === false ? 'failed' : 'success'));
+  const updated = Array.isArray(result?.results) ? result.results.length : 0;
+  const failedCount = Array.isArray(result?.failed) ? result.failed.length : 0;
+  const retryCount = Math.max(0, Number(result?.retryCount) || 0);
+  if (status === 'failed') {
+    const failedText = failedCount ? `${failedCount} 位未完成` : '未完成';
+    return {
+      phase: 'consolidate-error',
+      status,
+      ok: false,
+      error: `整理失败：${failedText}，已保留原印象${retryCount ? '；稍后会自动重试' : ''}`
+    };
+  }
+  if (status === 'partial_failed') {
+    return {
+      phase: 'consolidate-done',
+      status,
+      ok: false,
+      note: `部分完成：${updated} 位已更新，${failedCount} 位失败${retryCount ? '；失败的成员会按退避自动重试' : ''}`
+    };
+  }
+  if (status === 'no_targets') {
+    return { phase: 'consolidate-done', status, ok: true, note: String(result?.note || '没有可整理的群友') };
+  }
+  return {
+    phase: 'consolidate-done',
+    status: 'success',
+    ok: true,
+    note: String(result?.note || '整理完成')
+  };
+}
+
+/** 统一的 memory-update 事件发送入口，便于路由与测试复用同一套语义。 */
+export function emitConsolidationResult(emit, chatKey, result) {
+  emit('memory-update', { chatKey, ...buildConsolidationUpdate(result) });
 }
 
 export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
@@ -179,12 +239,29 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
   const stickers = new StickerManager(onebot);
   const sender = new SendQueue({
     onebot, store,
-    onSent: ({ chatKey, text }) => log(`[发送 -> ${chatKey}] ${String(text).slice(0, 60)}`),
+    onSent: (event) => {
+      const { chatKey, text } = event;
+      log(`[发送 -> ${chatKey}] ${String(text).slice(0, 60)}`);
+      try {
+        if (!personalityLearning.active) return;
+        const last = store.recent(chatKey, { limit: 10 }).filter(m => !m.self).at(-1);
+        personalityLearning.observe({ ...event, context: last?.text || '', sourceId: last?.senderId || '' });
+      } catch { log('[personality-learning] 观察失败；已发送结果不受影响'); }
+    },
     onIncident: (error, context) => incidentPilot?.capture(error, context)
   });
   let identityPilot = null;
   let identityPilotError = '';
+  const bridgeReceipts = new BridgeReceiptGuard(path.join(DATA_DIR,'bridge-receipts.sqlite'));
+  const slangLearning = new SlangLearning({
+    dataDir: DATA_DIR, config: getConfig, allowed: (chat) => chatAllowed(chat),
+    canWork: (chat) => chat ? canRun(chat) : getConfig().runtime?.mode === 'active' && !getConfig().runtime?.paused && isTimeActive(),
+    extract: extractSlang, research: researchSlang
+  });
+  const personalityLearning = new PersonalityLearning({ dataDir: DATA_DIR, allowed: (chat) => chatAllowed(chat) });
   const orchestrator = new Orchestrator({
+    getPersonalityLearning: () => personalityLearning,
+    getSlangLearning: () => slangLearning,
     store,
     memory,
     stickers,
@@ -195,11 +272,13 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     getIdentityPilot: () => identityPilot,
     getIncidentPilot: () => incidentPilot
   });
+  const qzoneBridge = new QzoneBridgeClient();
   const dailyMoments = new DailyMomentsManager({
     store,
     memory,
     stickers,
     onebot,
+    qzone: qzoneBridge,
     sessions,
     resolveChatName: (groupId) => orchestrator.getChatName(groupId),
     setProactiveSuppressed: (suppressed) =>
@@ -209,6 +288,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
   });
   const qzoneInteractions = new QzoneInteractionManager({
     onebot,
+    qzone: qzoneBridge,
     sessions,
     setProactiveSuppressed: (suppressed) =>
       orchestrator.setProactiveSuppressed('qzone-interactions', suppressed),
@@ -556,6 +636,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     // 屏蔽名单：被屏蔽群员的消息直接丢弃 —— 不存档、不触发会话、不进提示词背景。
     // 放在最前面：连合并转发展开这种网络请求都不值得为它做。
     if (kind === 'group' && senderId && (cfgNow.blocklist?.[id] || []).map(String).includes(senderId)) return;
+    if (bridgeReceipts.has(onebot.selfId, chatKey, event.message_id)) return;
     const media = segments ? extractMediaFromSegments(segments) : [];
     const mentionsSelf = Boolean(segments?.some((segment) =>
       segment?.type === 'at'
@@ -580,6 +661,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
         }
       }
       text = await segmentsToText(segments, {
+        includeAtIds: true,
         resolveReply: (mid) => (
           reply && String(reply.messageId) === String(mid)
             ? reply
@@ -637,6 +719,10 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
       )
     ) return;
     if (!isSelf) orchestrator.onIncoming(chatKey);
+    if (!isSelf) {
+      try { slangLearning.observe(chatKey, stored); }
+      catch { log('[slang-learning] 采集失败；实时聊天继续'); }
+    }
   }
 
   async function handleFriendProposalAdminCommand(kind, id, text) {
@@ -1035,6 +1121,64 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
       if (!authorize(req)) return json(res, 401, { error: '未授权' });
       const method = req.method;
       const cfgNow = getConfig();
+
+      if (pathname.startsWith('/api/personality-learning/')) {
+        try {
+          const action = pathname.slice('/api/personality-learning/'.length);
+          if (method === 'GET' && action === 'status') return json(res, 200, personalityLearning.status());
+          if (method === 'GET' && action === 'data') return json(res, 200, personalityLearning.snapshot());
+          if (method === 'POST') {
+            if (!cfgNow.admin?.ownerUin) return json(res, 403, { error: '须先配置全局管理员' });
+            const body = await readBody(req);
+            if (action === 'settings') {
+              const { confirm, ...patch } = body;
+              return json(res, 200, personalityLearning.configure(patch, confirm === true));
+            }
+            if (body.confirm !== true) return json(res, 409, { error: '此操作需要明确确认' });
+            if (action === 'analyze') return json(res, 200, personalityLearning.analyze());
+            if (action === 'feedback') return json(res, 200, personalityLearning.feedback(body));
+            if (action === 'cleanup') { personalityLearning.cleanup(); return json(res, 200, { ok: true }); }
+            if (action === 'habit') return json(res, 200, { version: personalityLearning.change(body.id, body.status, body.expectedVersion) });
+            if (action === 'global') return json(res, 200, { version: personalityLearning.promoteGlobal(body.id, body.expectedVersion) });
+            if (action === 'rollback') return json(res, 200, { version: personalityLearning.rollback(body.version, body.expectedVersion) });
+          }
+          return json(res, 404, { error: '未知人格学习接口' });
+        } catch (error) {
+          // Only module-authored validation messages are suitable for operators.
+          log('[personality-learning] 管理操作失败；原有聊天继续');
+          return json(res, 400, { error: '操作未完成，请检查设置、授权群、证据阈值和当前版本；原数据未重置' });
+        }
+      }
+
+      if (pathname.startsWith('/api/slang-learning/')) {
+        try {
+          const action = pathname.slice('/api/slang-learning/'.length);
+          if (method === 'GET' && action === 'status') return json(res, 200, slangLearning.status());
+          if (method === 'GET' && action === 'discoveries') return json(res, 200, slangLearning.store.list({ status: url.searchParams.get('status') || '', limit: Number(url.searchParams.get('limit')) || 100 }));
+          if (method === 'GET' && action === 'feedback') {
+            const rows = fs.existsSync(slangLearning.store.file) ? slangLearning.store.open().prepare("SELECT * FROM audit WHERE action='feedback' ORDER BY seq DESC LIMIT 100").all() : [];
+            return json(res, 200, rows.map(r => ({ ...r, details: JSON.parse(r.details) })));
+          }
+          if (method === 'POST') {
+            const body = await readBody(req);
+            const actor = cfgNow.admin?.ownerUin;
+            slangLearning.assertAdmin(actor);
+            if (action === 'settings') {
+              const previous = slangLearning.settings();
+              const settings = slangLearningSettings({ ...previous, ...body });
+              if (body.graduated === true && !previous.graduated && body.confirm !== true) throw Error('固化需要明确确认');
+              if (settings.enabled && !settings.groups.length) throw Error('启用前必须在独立页面指定授权群');
+              updateConfig({ slangLearning: settings });
+              await slangLearning.sync();
+              return json(res, 200, slangLearning.status());
+            }
+            if (body.confirm !== true) throw Error('该操作需要明确确认');
+            if (action === 'review') return json(res, 200, slangLearning.review(body.id, body.decision, actor));
+            if (action === 'withdraw') return json(res, 200, slangLearning.withdraw(body.chat, body.id, actor));
+          }
+          return json(res, 404, { error: '未知黑话学习接口' });
+        } catch { return json(res, 400, { error: '黑话学习操作失败，请检查权限、授权群与词条状态' }); }
+      }
 
       if (pathname === '/api/console-token' && method === 'POST') {
         const body = await readBody(req);
@@ -1616,7 +1760,9 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
         try {
           const body = await readBody(req).catch(() => ({}));
           const baseUrl = String(body.baseUrl ?? '').trim();
-          const type = String(body.type ?? 'openai').trim() === 'bing' ? 'bing' : 'openai';
+          // 只接受已知类型，其余一律回落 openai（避免脏值写进配置）
+          const rawType = String(body.type ?? 'openai').trim().toLowerCase();
+          const type = rawType === 'bing' || rawType === 'exa' ? rawType : 'openai';
           if (!baseUrl) return json(res, 400, { ok: false, error: '接口地址不能为空' });
           const list = [...(getConfig().webSearch?.providers || [])];
           const existing = list.find((p) => p.baseUrl === baseUrl && p.type === type);
@@ -1728,6 +1874,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
         const previousIdentityPilot = JSON.stringify(cfgNow.identityPilot || {});
         const previousPersona = JSON.stringify(cfgNow.persona || {});
         const previousSlangPilot = JSON.stringify(cfgNow.slangPilot || {});
+        const previousSlangLearning = JSON.stringify(cfgNow.slangLearning || {});
         const previousIncidentPilot = JSON.stringify(cfgNow.incidentPilot || {});
         const previousIdentitySources = JSON.stringify({
           allow: cfgNow.allow || {},
@@ -1820,6 +1967,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
           }
         }
         initPriceFeed(next.api?.priceRemoteUrl || '');   // 远程价格表 URL 可能改了（内部幂等）
+        if (JSON.stringify(next.slangLearning || {}) !== previousSlangLearning) await slangLearning.sync();
         emit('status', { configUpdated: true });
         return json(res, 200, { ok: true, config: sanitizeConfig(next) });
       }
@@ -2152,8 +2300,20 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
         }
         if (sticker?.source === 'ai') {
           sticker = await stickers.findForSend(id);
+          // findForSend 可能已经把它本地化：优先读本地副本，base64:// 不能走 safeFetchBinary。
+          const localized = stickers.readImage(id);
+          if (localized) {
+            res.writeHead(200, {
+              'content-type': localized.contentType,
+              'content-length': localized.buffer.length,
+              'cache-control': 'private, max-age=300',
+              'x-content-type-options': 'nosniff'
+            });
+            res.end(localized.buffer);
+            return;
+          }
         }
-        if (!sticker?.url) return json(res, 404, { error: '表情图片不存在' });
+        if (!sticker?.url) return json(res, 404, { error: '表情图片不存在或已失效' });
         try {
           const image = await safeFetchBinary(sticker.url, 8 * 1024 * 1024);
           const contentType = String(image.contentType || '').split(';')[0].trim().toLowerCase();
@@ -2470,6 +2630,15 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
 
       // 记忆文件列表（记忆页签）：白名单里的每个群都显示，含无记忆的
       if (pathname === '/api/memory-files' && method === 'GET') {
+        const consolidationView = (chatKey) => {
+          const state = memory.consolidationState(chatKey);
+          return {
+            status: state.lastResult || '',
+            retryCount: Array.isArray(state.retryMembers) ? state.retryMembers.length : 0,
+            lastAttemptedAt: Number(state.lastAttemptedAt) || 0,
+            lastConsolidatedAt: Number(state.lastConsolidatedAt) || 0
+          };
+        };
         const files = memory.listChats().map((chatKey) => {
           const members = memory.members(chatKey);
           const handoff = memory.getHandoff(chatKey);
@@ -2480,6 +2649,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
             memberCount: members.length,
             hasHandoff: Boolean(handoff),
             handoffExpiresAt: handoff?.expiresAt || 0,
+            consolidation: consolidationView(chatKey),
             updatedAt: Math.max(
               Number(handoff?.updatedAt) || 0,
               0,
@@ -2495,7 +2665,8 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
           if (!seen.has(key)) {
             files.push({
               chatKey: key, impressionCount: 0, memberCount: 0,
-              hasHandoff: false, handoffExpiresAt: 0, updatedAt: 0, consolidating: false
+              hasHandoff: false, handoffExpiresAt: 0, updatedAt: 0, consolidating: false,
+              consolidation: { status: '', retryCount: 0, lastAttemptedAt: 0, lastConsolidatedAt: 0 }
             });
           }
         }
@@ -2504,7 +2675,8 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
           if (!seen.has(key)) {
             files.push({
               chatKey: key, impressionCount: 0, memberCount: 0,
-              hasHandoff: false, handoffExpiresAt: 0, updatedAt: 0, consolidating: false
+              hasHandoff: false, handoffExpiresAt: 0, updatedAt: 0, consolidating: false,
+              consolidation: { status: '', retryCount: 0, lastAttemptedAt: 0, lastConsolidatedAt: 0 }
             });
           }
         }
@@ -2588,17 +2760,21 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
           // 手动触发：跳过门槛/冷却检查，且对零印象的人启用"新建印象"模式
           const force = body.force !== false;
 
-          if (orchestrator.consolidating.has(chatKey)) return json(res, 409, { ok: false, error: '该群已在整理中' });
-          orchestrator.consolidating.add(chatKey);
+          // 任务锁由 orchestrator 统一维护：同一 chatKey 同时只跑一个整理任务。
+          const task = orchestrator.startMemoryConsolidation(chatKey, { userIds, force });
+          if (!task) return json(res, 409, { ok: false, error: '该群已在整理中' });
           emit('memory-update', { chatKey, phase: 'consolidate-start', userIds });
-          orchestrator.consolidateMemoryForChat(chatKey, { userIds, force })
-            .then((result) => {
-              emit('memory-update', { chatKey, phase: 'consolidate-done', ...(result || {}) });
-            })
+          task
+            .then((result) => emitConsolidationResult(emit, chatKey, result))
             .catch((error) => {
-              emit('memory-update', { chatKey, phase: 'consolidate-error', error: String(error?.message ?? error) });
-            })
-            .finally(() => orchestrator.consolidating.delete(chatKey));
+              emit('memory-update', {
+                chatKey,
+                phase: 'consolidate-error',
+                status: 'failed',
+                ok: false,
+                error: safeConsolidationError(error)
+              });
+            });
           return json(res, 202, { ok: true, started: true });
         } catch (error) {
           return json(res, 400, { ok: false, error: String(error?.message ?? error) });
@@ -2828,6 +3004,9 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     }
     refreshTimeControl();
     orchestrator.startRecoveryLoop();
+    personalityLearning.start();
+    try { await slangLearning.sync(); }
+    catch { log('[slang-learning] 后台模块启动失败；聊天主流程继续'); }
     if (getConfig().dailyMoments?.enabled) dailyMoments.start();
     if (getConfig().qzoneInteractions?.enabled) qzoneInteractions.start();
     if (getConfig().proactive?.enabled) orchestrator.startProactiveLoop();
@@ -2848,6 +3027,9 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     autoUpdate.stop();
     identityPilot?.stop();
     identityPilot = null;
+    await slangLearning.stop();
+    personalityLearning.stop();
+    bridgeReceipts.close();
     await slangPilot?.stop();
     slangPilot = null;
     await incidentPilot?.stop();
@@ -2883,6 +3065,7 @@ export function createApp({ log = console.log, autoUpdateOptions = {} } = {}) {
     sender,
     sessions,
     orchestrator,
+    personalityLearning,
     dailyMoments,
     qzoneInteractions,
     assetObserver,

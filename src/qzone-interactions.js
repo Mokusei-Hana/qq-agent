@@ -22,6 +22,7 @@ import {
   qzoneInteractionPersonaHash,
   QZONE_INTERACTION_PROMPT_VERSION
 } from './qzone-interaction-prompt.js';
+import { onebotNeedsQzoneBridge, qzoneBridgeRequiredMessage } from './qzone-bridge.js';
 
 const STATE_FILE = path.join(DATA_DIR, 'qzone-interactions.json');
 const HOUR_MS = 60 * 60 * 1000;
@@ -49,6 +50,20 @@ function writeJson(file, value) {
 
 function interactionError(code, message, httpStatus = 409) {
   return Object.assign(new Error(message), { code, httpStatus });
+}
+
+// 桥接关闭时只有 SnowLuma 能处理空间动作；NapCat 会返回「不支持的Api」，
+// 这里直接给出可操作的配置错误，避免把无效请求发给协议端。
+function qzoneChannel(qzone, onebot, feature) {
+  if (qzone?.enabled) return qzone;
+  if (onebotNeedsQzoneBridge(onebot)) {
+    throw interactionError(
+      'QZONE_BRIDGE_REQUIRED',
+      qzoneBridgeRequiredMessage(onebot, feature),
+      503
+    );
+  }
+  return null;
 }
 
 function normalizedConfig(raw = getConfig().qzoneInteractions || {}) {
@@ -270,6 +285,7 @@ export class QzoneInteractionManager {
     emit = null,
     complete = chatCompletionWithRetry,
     qzoneWeb = null,
+    qzone = null,
     setProactiveSuppressed = () => {},
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     now = () => Date.now(),
@@ -282,6 +298,7 @@ export class QzoneInteractionManager {
     this.emit = typeof emit === 'function' ? emit : () => {};
     this.complete = complete;
     this.qzoneWeb = qzoneWeb || new QzoneWebClient(onebot);
+    this.qzone = qzone;
     this.setProactiveSuppressed = setProactiveSuppressed;
     this.sleep = sleep;
     this.now = now;
@@ -522,17 +539,24 @@ export class QzoneInteractionManager {
   }
 
   async #discoverFeeds(cfg, signal) {
-    const data = await this.onebot.call(
-      'get_qzone_feeds',
-      { page_num: 1, count: cfg.feedFetchCount },
-      30000,
-      signal
-    );
-    if (!Array.isArray(data?.feeds)) throw new Error('好友动态接口返回格式无效');
+    const qzone = qzoneChannel(this.qzone, this.onebot, '读取好友动态');
+    let posts;
+    if (qzone) {
+      posts = await qzone.getFeedPosts({ count: cfg.feedFetchCount, signal });
+      if (!Array.isArray(posts)) throw new Error('好友动态接口返回格式无效');
+    } else {
+      const data = await this.onebot.call(
+        'get_qzone_feeds',
+        { page_num: 1, count: cfg.feedFetchCount },
+        30000,
+        signal
+      );
+      if (!Array.isArray(data?.feeds)) throw new Error('好友动态接口返回格式无效');
+      posts = data.feeds.map(parseQzoneFeed);
+    }
     const cutoff = Math.floor((this.now() - cfg.maxAgeHours * HOUR_MS) / 1000);
     let discovered = 0;
-    for (const raw of data.feeds) {
-      const post = parseQzoneFeed(raw);
+    for (const post of posts) {
       if (post.appid !== 311 || !post.tid || !post.uin || post.time < cutoff) continue;
       if (post.uin === String(this.onebot.selfId || '')) {
         this.#watchPost(post);
@@ -563,12 +587,15 @@ export class QzoneInteractionManager {
   async #discoverReplies(cfg, signal) {
     const selfId = String(this.onebot.selfId || '');
     if (!selfId) throw new Error('无法确认当前登录 QQ');
-    const own = await this.onebot.call(
-      'get_qzone_msg_list',
-      { target_uin: Number(selfId), pos: 0, num: cfg.ownPostCount },
-      30000,
-      signal
-    );
+    const qzone = qzoneChannel(this.qzone, this.onebot, '读取自己的说说');
+    const own = qzone
+      ? await qzone.getMoments({ num: cfg.ownPostCount, signal })
+      : await this.onebot.call(
+        'get_qzone_msg_list',
+        { target_uin: Number(selfId), pos: 0, num: cfg.ownPostCount },
+        30000,
+        signal
+      );
     if (!Array.isArray(own?.msglist)) throw new Error('自己的动态列表返回格式无效');
     const candidates = new Map();
     for (const item of own.msglist) {
@@ -610,7 +637,9 @@ export class QzoneInteractionManager {
       .slice(0, 20)) {
       signal?.throwIfAborted();
       try {
-        const detail = await this.qzoneWeb.getPostDetail(post.uin, post.tid, signal);
+        const detail = qzone
+          ? await qzone.getComments({ uin: post.uin, tid: post.tid, num: 50, signal })
+          : await this.qzoneWeb.getPostDetail(post.uin, post.tid, signal);
         const before = this.state.comments.length;
         this.#queueComments({ ...post, ...detail });
         discovered += this.state.comments.length - before;
@@ -877,6 +906,7 @@ export class QzoneInteractionManager {
   async #executePlan(plan, batch, cfg, signal, run) {
     const feedMap = new Map(batch.feeds.map((item) => [item.id, item.state]));
     const replyMap = new Map(batch.replies.map((item) => [item.id, item.state]));
+    const qzone = qzoneChannel(this.qzone, this.onebot, '执行空间互动');
     let writes = 0;
     for (const action of plan.replyActions) {
       const item = replyMap.get(action.id);
@@ -892,14 +922,23 @@ export class QzoneInteractionManager {
       item.replyContent = action.content;
       this.#save();
       try {
-        const result = await this.qzoneWeb.replyComment({
-          ownerUin: item.post.uin,
-          tid: item.post.tid,
-          comment: item.comment,
-          rootComment: this.#findRoot(item),
-          content: action.content,
-          signal
-        });
+        const result = qzone
+          ? await qzone.replyComment({
+            uin: item.post.uin,
+            tid: item.post.tid,
+            comment: item.comment,
+            rootComment: this.#findRoot(item),
+            content: action.content,
+            signal
+          })
+          : await this.qzoneWeb.replyComment({
+            ownerUin: item.post.uin,
+            tid: item.post.tid,
+            comment: item.comment,
+            rootComment: this.#findRoot(item),
+            content: action.content,
+            signal
+          });
         item.status = 'replied';
         item.replyCommentId = result.commentId || '';
         item.updatedAt = this.now();
@@ -933,11 +972,18 @@ export class QzoneInteractionManager {
       if (wantsComment) {
         await this.#pauseBetweenActions(cfg, writes++);
         try {
-          const result = await this.onebot.call('comment_qzone', {
-            tid: item.post.tid,
-            target_uin: Number(item.post.uin),
-            content: action.content
-          }, 30000, signal);
+          const result = qzone
+            ? await qzone.commentPost({
+              uin: item.post.uin,
+              tid: item.post.tid,
+              content: action.content,
+              signal
+            })
+            : await this.onebot.call('comment_qzone', {
+              tid: item.post.tid,
+              target_uin: Number(item.post.uin),
+              content: action.content
+            }, 30000, signal);
           item.commentStatus = 'done';
           item.commentId = String(result?.comment_id || '');
           this.#watchPost(item.post, { ownComment: action.content });
@@ -954,11 +1000,20 @@ export class QzoneInteractionManager {
       if (wantsLike && !item.post.isLiked) {
         await this.#pauseBetweenActions(cfg, writes++);
         try {
-          await this.onebot.call('like_qzone', {
-            tid: item.post.tid,
-            target_uin: Number(item.post.uin),
-            abstime: Number(item.post.time) || 0
-          }, 30000, signal);
+          if (qzone) {
+            await qzone.likePost({
+              uin: item.post.uin,
+              tid: item.post.tid,
+              abstime: Number(item.post.time) || 0,
+              signal
+            });
+          } else {
+            await this.onebot.call('like_qzone', {
+              tid: item.post.tid,
+              target_uin: Number(item.post.uin),
+              abstime: Number(item.post.time) || 0
+            }, 30000, signal);
+          }
           item.likeStatus = 'done';
           run.actions.push({ type: 'like', key: item.key, status: 'done' });
         } catch (error) {

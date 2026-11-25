@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { OneBotClient } from './onebot.js';
 import { DATA_DIR, getConfig } from './config.js';
+import { validateImageUrl, safeFetchBinary } from './safe-fetch.js';
 import {
   loadStickerStore, saveStickerStore, mergeStickerLibrary,
   findSticker, formatStickerList, applyStickerNote, markStickerUsed,
@@ -135,37 +136,90 @@ export class StickerManager {
     return findSticker(synced.entries, ref);
   }
 
-  /** QQ 消息图片 URL 带短期 rkey；发送 AI 收藏图前按原消息刷新。 */
-  async findForSend(ref) {
+  /**
+   * 解析一个"可以直接发给 OneBot"的表情。
+   *
+   * QQ 消息图片地址带短期 rkey，存下来的 URL 过一段时间必然失效（HTTP 400
+   * download url has expired）。所以这里按可用性排序逐级降级：
+   *   1. 已有本地文件 → base64://，永久可用，不碰网络；
+   *   2. 按原消息 get_msg 拿新签名（原消息还在时最省流量）；
+   *   3. 把字节抓下来落盘，之后再也不用管签名；
+   *   4. 全都拿不到 → 标记该表情失效并返回 null，避免把坏 URL 交给 NapCat
+   *      换来一条看不懂的 "下载文件失败: Bad Request"。
+   *
+   * 返回 null 表示"这个表情现在发不出去"，调用方应提示模型换一个。
+   */
+  async findForSend(ref, { signal } = {}) {
     const sticker = await this.find(ref);
-    if (sticker?.localFile) {
-      const image = this.readImage(ref);
-      if (!image) return null;
-      return {
-        ...sticker,
-        url: `base64://${image.buffer.toString('base64')}`
-      };
+    if (!sticker) return null;
+    if (sticker.localFile) {
+      const image = this.readImage(sticker.id);
+      if (image) {
+        return { ...sticker, url: `base64://${image.buffer.toString('base64')}` };
+      }
+      // 本地文件丢了但不是失效态：继续往下试远端地址。
     }
-    const messageId = /^collected_(-?\d+)$/.exec(String(sticker?.id || ''))?.[1];
-    if (!sticker || sticker.source !== 'ai' || !messageId) return sticker;
-    try {
-      const data = await this.onebot.getMsg(Number(messageId));
-      const segments = Array.isArray(data?.message) ? data.message : [];
-      const image = segments.find((segment) => segment?.type === 'image');
-      const freshUrl = String(image?.data?.url || image?.data?.file || '').trim();
-      if (!/^https?:\/\//i.test(freshUrl)) return sticker;
-      // #region debug-point C:sticker-url-refresh
-      if (!String(process.argv[1]).includes('/test/')) (() => { try { const oldUrl = new URL(sticker.url); const nextUrl = new URL(freshUrl); const body = JSON.stringify({ sessionId: 'agent-time-sticker-download', runId: 'post-fix', hypothesisId: 'C', location: 'src/sticker-manager.js:findForSend', msg: '[DEBUG] Refreshed collected sticker URL', data: { stickerId: sticker.id, messageId, oldHost: oldUrl.host, freshHost: nextUrl.host, changed: freshUrl !== sticker.url, freshQueryKeys: [...nextUrl.searchParams.keys()] }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
-      // #endregion
-      if (freshUrl === sticker.url) return sticker;
-      const refreshed = { ...sticker, url: freshUrl, updatedAt: new Date().toISOString() };
-      this.saveEntries(
-        this.entries.map((entry) => entry.id === sticker.id ? refreshed : entry)
-      );
-      return refreshed;
-    } catch {
-      return sticker;
+    // 已知失效的条目不再浪费一次网络往返。
+    if (sticker.imageUnavailableAt) return null;
+
+    let candidate = sticker;
+    let refreshed = false;
+    const messageId = /^collected_(-?\d+)$/.exec(String(sticker.id))?.[1];
+    if (sticker.source === 'ai' && messageId) {
+      try {
+        const data = await this.onebot.getMsg(Number(messageId));
+        const segments = Array.isArray(data?.message) ? data.message : [];
+        const image = segments.find((segment) => segment?.type === 'image');
+        const freshUrl = String(image?.data?.url || image?.data?.file || '').trim();
+        if (/^https?:\/\//i.test(freshUrl) && freshUrl !== sticker.url) {
+          candidate = { ...sticker, url: freshUrl };
+          refreshed = true;
+        }
+      } catch {
+        // 原消息通常早就没了（NapCat 返回"消息不存在"），继续走本地化兜底。
+      }
     }
+
+    if (refreshed) {
+      // 换到新签名后先落库：即便这次抓取失败，下次也不必再问一遍 get_msg。
+      try {
+        this.saveEntries(
+          this.entries.map((entry) => (entry.id === sticker.id
+            ? normalizeStickerEntry({ ...candidate, updatedAt: new Date().toISOString() })
+            : entry))
+        );
+      } catch {
+        // 落库失败不影响本次发送。
+      }
+    }
+
+    const localized = await this.#localizeRemote(sticker.id, candidate.url, signal);
+    if (localized.ok) {
+      const pinned = normalizeStickerEntry({
+        ...candidate,
+        localFile: localized.localFile,
+        imageUnavailableAt: 0,
+        imageUnavailableReason: '',
+        updatedAt: new Date().toISOString()
+      });
+      try {
+        this.saveEntries(
+          this.entries.map((entry) => (entry.id === sticker.id ? pinned : entry))
+        );
+      } catch {
+        // 存不下也不影响本次发送：用附件 buffer 直接发。
+      }
+      const image = this.readImage(sticker.id);
+      if (image) return { ...pinned, url: `base64://${image.buffer.toString('base64')}` };
+    }
+
+    if (refreshed) {
+      // 拿到过新签名却没抓下来，更像网络抖动而不是地址过期：
+      // 交回候选 URL，保持原来"让 OneBot 试一次"的语义，不要误标死。
+      return candidate;
+    }
+    this.markImageUnavailable(sticker.id, localized.reason || '图片地址已失效');
+    return null;
   }
 
   note(id, patch) {
@@ -190,12 +244,7 @@ export class StickerManager {
     const contentType = imageType(buffer);
     if (!contentType) throw new Error('仅支持 PNG、JPEG、GIF 或 WebP 图片');
     const id = `manual_${crypto.randomUUID().replaceAll('-', '').slice(0, 16)}`;
-    const relativeFile = `sticker-assets/${id}.${IMAGE_EXTENSIONS[contentType]}`;
-    const file = path.join(DATA_DIR, relativeFile);
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, buffer, { mode: 0o600 });
-    fs.renameSync(tmp, file);
+    const relativeFile = this.#writeAsset(id, buffer, contentType);
     const now = new Date().toISOString();
     const entry = normalizeStickerEntry({
       id,
@@ -216,10 +265,79 @@ export class StickerManager {
     try {
       this.saveEntries(nextEntries);
     } catch (error) {
-      try { fs.rmSync(file, { force: true }); } catch { /* ignore */ }
+      try { fs.rmSync(path.join(DATA_DIR, relativeFile), { force: true }); } catch { /* ignore */ }
       throw error;
     }
     return entry;
+  }
+
+  /**
+   * 把一张图片写进本地资源目录，返回相对路径。
+   * 只落盘不登记条目，调用方负责 saveEntries。
+   */
+  #writeAsset(id, buffer, contentType) {
+    const ext = IMAGE_EXTENSIONS[contentType];
+    if (!ext) throw new Error('不支持的图片格式');
+    const relativeFile = `sticker-assets/${id}.${ext}`;
+    const file = path.join(DATA_DIR, relativeFile);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, buffer, { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return relativeFile;
+  }
+
+  /**
+   * 尝试把一个远端的临时图片地址固化成本地文件。
+   *
+   * 背景：QQ 消息图片地址带短期 rkey 签名，收藏时存下的 URL 过一段时间必然 400。
+   * 只要在收藏那一刻抓到字节并且落盘，之后就能像手动表情一样用 base64:// 发送，
+   * 不再受签名过期影响。
+   *
+   * 失败不抛错（返回 { ok:false }），让调用方决定降级策略：
+   * 收藏动作本身不该因为图片暂时下载不到而整体失败。
+   */
+  async #localizeRemote(id, url, signal) {
+    const target = String(url || '').trim();
+    if (!/^https?:\/\//i.test(target)) {
+      return { ok: false, reason: '图片地址不是 http(s)' };
+    }
+    let buffer;
+    try {
+      const safeUrl = await validateImageUrl(target);
+      const fetched = await safeFetchBinary(safeUrl, MAX_STICKER_BYTES, signal);
+      buffer = fetched?.buffer;
+    } catch (error) {
+      return { ok: false, reason: String(error?.message ?? error).slice(0, 200) };
+    }
+    if (!buffer || !buffer.length) return { ok: false, reason: '图片内容为空' };
+    if (buffer.length > MAX_STICKER_BYTES) return { ok: false, reason: '图片超过 8 MiB' };
+    const contentType = imageType(buffer);
+    if (!contentType) return { ok: false, reason: '返回内容不是可识别的图片' };
+    try {
+      const relativeFile = this.#writeAsset(id, buffer, contentType);
+      return { ok: true, localFile: relativeFile };
+    } catch (error) {
+      return { ok: false, reason: String(error?.message ?? error).slice(0, 200) };
+    }
+  }
+
+  /**
+   * 标记一个表情的远端地址已失效：不再参与列表/提示词，避免模型反复挑中。
+   * 已有本地文件的条目不标记（它们本来就不依赖远端地址）。
+   */
+  markImageUnavailable(id, reason = '') {
+    const target = findSticker(this.entries, id);
+    if (!target || target.localFile) return null;
+    const next = normalizeStickerEntry({
+      ...target,
+      imageUnavailableAt: Date.now(),
+      imageUnavailableReason: cleanMetadata(reason, 200),
+      updatedAt: new Date().toISOString()
+    });
+    const nextEntries = this.entries.map((entry) => (entry.id === target.id ? next : entry));
+    this.saveEntries(nextEntries);
+    return next;
   }
 
   update(id, patch = {}) {
@@ -289,8 +407,14 @@ export class StickerManager {
     return result.entry;
   }
 
-  /** 收藏一条消息里的图片（本地新增条目，不入 QQ 收藏）。 */
-  collect(messageId, { url, note = '' } = {}) {
+  /**
+   * 收藏一条消息里的图片（本地新增条目，不入 QQ 收藏）。
+   *
+   * 收藏时就尝试把字节落盘：QQ 的图片地址带短期 rkey，此刻不抓，
+   * 之后基本再也抓不到了（原消息一过期，签名也刷新不出来）。
+   * 落盘失败仍然登记条目——用户刚明确收藏了它，本地条目不能凭空消失。
+   */
+  async collect(messageId, { url, note = '', signal } = {}) {
     if (!getConfig().sticker?.collectEnabled) throw new Error('收藏表情功能未开启');
     // 限频
     const now = Date.now();
@@ -305,10 +429,14 @@ export class StickerManager {
     if (existing) {
       return this.note(id, { note: String(note || '') });
     }
-    const entry = {
+
+    const localized = await this.#localizeRemote(id, url, signal);
+    const timestamp = new Date().toISOString();
+    const entry = normalizeStickerEntry({
       id,
       resId: id,
       url,
+      localFile: localized.ok ? localized.localFile : '',
       md5: '',
       desc: String(note || '').slice(0, 20),
       localNote: String(note || ''),
@@ -318,10 +446,17 @@ export class StickerManager {
       useCount: 0,
       lastUsedAt: 0,
       lastContext: '',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-    this.saveEntries([...this.entries, entry]);
+      createdAt: timestamp,
+      updatedAt: timestamp
+    });
+    try {
+      this.saveEntries([...this.entries, entry]);
+    } catch (error) {
+      if (localized.ok) {
+        try { fs.rmSync(path.join(DATA_DIR, localized.localFile), { force: true }); } catch { /* ignore */ }
+      }
+      throw error;
+    }
     this.collectTimes.push(now);
     return entry;
   }

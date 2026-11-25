@@ -72,7 +72,7 @@ async function waitFor(fn, timeoutMs = 8000, label = 'condition') {
 // ── Mock OneBot（HTTP + WS） ──
 function createMockOneBotHttp() {
   const state = { sends: [], pokes: [], friendPackets: [], friendDecisions: [] };
-  const TINY_PNG = Buffer.from('89504e470d0a1a0a0000000d4948445200000001000000010806000000', 'hex');
+  const TINY_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
   const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     const action = req.url.replace(/^\//, '');
@@ -660,7 +660,7 @@ async function main() {
   const imgUserIdx = visReq.messages.findIndex((m) => m.role === 'user' && Array.isArray(m.content));
   assert.ok(imgUserIdx > -1, '图片以 user 消息注入');
   const imgPart = visReq.messages[imgUserIdx].content.find((p) => p.type === 'image_url');
-  assert.ok(imgPart && String(imgPart.image_url.url).startsWith('data:image/png;base64,'), '图片为 PNG data URL');
+  assert.ok(imgPart && String(imgPart.image_url.url).startsWith('data:image/jpeg;base64,'), '图片为 JPEG data URL');
   const visToolIdx = visReq.messages.findIndex((m) => m.role === 'tool' && m.name === 'get_message_images');
   assert.ok(visToolIdx > -1 && visToolIdx < imgUserIdx, '消息顺序合法：tool 结果在前，图片 user 消息在后');
   pass('图片输入：tool 文本 + user 消息 image_url 补发，结构兼容 OpenAI 校验');
