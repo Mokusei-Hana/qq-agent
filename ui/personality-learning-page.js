@@ -13,6 +13,16 @@
   ['module-settings','采集与预算']
  ];
  function node(tag,text){const e=document.createElement(tag);if(text!==undefined)e.textContent=String(text);return e;}
+ function newId(){
+  if(typeof crypto!=='undefined'&&typeof crypto.randomUUID==='function')return crypto.randomUUID();
+  if(typeof crypto!=='undefined'&&typeof crypto.getRandomValues==='function'){
+   const b=new Uint8Array(16);crypto.getRandomValues(b);
+   b[6]=(b[6]&0x0f)|0x40;b[8]=(b[8]&0x3f)|0x80;
+   const h=Array.from(b,x=>x.toString(16).padStart(2,'0')).join('');
+   return h.slice(0,8)+'-'+h.slice(8,12)+'-'+h.slice(12,16)+'-'+h.slice(16,20)+'-'+h.slice(20);
+  }
+  return 'id-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,12);
+ }
  function button(label,action){const e=node('button',label);e.type='button';e.onclick=()=>guard(action);return e;}
  async function request(action,body){
   const options={credentials:'same-origin',headers:{'content-type':'application/json'}};
@@ -236,7 +246,7 @@
  async function makePreview(input){
   preview=null;$('publication-preview').hidden=true;
   const p=await request('preview',{expectedVersion:state.version,...input});
-  preview={...p,idempotencyKey:crypto.randomUUID()};
+  preview={...p,idempotencyKey:newId()};
   const summary=$('preview-summary');summary.replaceChildren();
   field(summary,'版本变化','将从 v'+state.version+' 升级为新版本（生效规则：'+current.length+' 条 → '+p.entries.length+' 条）');
   for(const entry of p.entries){
@@ -260,7 +270,7 @@
    patch={rule};
    if(!confirm('确认保存新措辞？\n原规则：'+row.rule_text+'\n新规则：'+rule))return;
   }else if(!confirm(action==='reject'?'确认不采用这条建议？':'确认先标记为观望？'))return;
-  await request('decide',{confirm:true,action,id:row.preference_id,revision:row.revision,reason,patch,idempotencyKey:crypto.randomUUID()});
+  await request('decide',{confirm:true,action,id:row.preference_id,revision:row.revision,reason,patch,idempotencyKey:newId()});
   await refresh();
  }
 
