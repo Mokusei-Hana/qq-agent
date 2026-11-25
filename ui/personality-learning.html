@@ -1,20 +1,233 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>人格自我迭代 · QQ Agent</title><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/personality-learning.css"></head>
-<body><main><a href="/">← 返回控制台</a><header><div><p>QQ AGENT / PERSONALITY</p><h1>人格自我迭代</h1><p>观察表达，积累证据，逐步改进。核心人设、安全与权限由人工维护。</p></div><button id="refresh">刷新</button></header>
-<p id="error" role="alert" hidden></p><p id="status" role="status">正在连接…</p>
-<section><h2>学习设置</h2><form id="settings">
-<label>授权群号（逗号分隔）<input id="groups" autocomplete="off"></label>
-<label>运行模式<select id="mode"><option value="observe">观察：只统计，不改变回复</option><option value="dynamic">动态：允许使用已验证的偏好</option></select></label>
-<label><input type="checkbox" id="enabled">启用人格学习</label>
-<label><input type="checkbox" id="injectEnabled">注入已激活的动态偏好</label>
-<label><input type="checkbox" id="autoApply">自动应用满足阈值的低风险偏好</label>
-<div class="fields"><label>最低证据数<input id="minEvidence" type="number" min="10" max="1000"></label><label>最低置信度<input id="minConfidence" type="number" min="0.8" max="1" step="0.01"></label><label>最小观察天数<input id="minWindowDays" type="number" min="3" max="30"></label><label>最少不同互动对象<input id="minSources" type="number" min="2" max="30"></label><label>观察保留天数<input id="retentionDays" type="number" min="7" max="90"></label></div>
-<p>初期保持观察模式。停用后保留全部数据；本页仅保存人格学习设置。</p><button type="submit">保存设置</button></form>
-<div class="actions"><button id="analyze">生成统计与候选</button><button id="cleanup">清理到期观察</button></div></section>
-<section><h2>近期表达统计</h2><p>只保存固定标签、哈希和统计值，不保存回复原文。统计不是语义或事实正确性的自动判断。</p><div id="stats"></div></section>
-<section><h2>候选与生效习惯</h2><p>证据数量、不同来源、置信度和观察窗口全部达标后才允许激活。群级规则默认不跨群。</p><div id="habits"></div></section>
-<section><h2>版本与成长日志</h2><p>版本差异只包含动态表达偏好。回滚不会覆盖群聊记忆、黑话库或核心人格。</p><div id="versions"></div></section>
-<section><h2>人工评价与弱反馈</h2><p>弱反馈单独记录，不把回复或点赞等同于质量。反馈不能直接修改规则。</p>
-<form id="feedback"><div class="fields"><label>群号<input id="feedback-group" required></label><label>已观察回复 ID<input id="feedback-response" required maxlength="100"></label><label>评价维度<select id="feedback-type"><option value="relevance">相关性</option><option value="naturalness">自然度</option><option value="repetition">句式重复</option><option value="filler">空洞填充</option><option value="emotion">情绪匹配</option><option value="agreement">过度附和</option><option value="interruption">强行接话</option><option value="persona">核心人格符合度</option><option value="weak_reply">弱信号：后续回复</option><option value="weak_like">弱信号：点赞</option></select></label><label>评价<select id="feedback-score"><option value="0">待判断／中性</option><option value="1">正面</option><option value="-1">负面</option></select></label></div><button>记录反馈</button></form><div id="feedback-list"></div></section>
-</main><script src="/personality-learning-page.js"></script></body></html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>人格自我迭代 · QQ Agent</title>
+  <script>try{const t=localStorage.getItem('qqa-theme');document.documentElement.dataset.theme=t==='light'||t==='dark'?t:matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'}catch{}</script>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/personality-learning.css">
+</head>
+<body class="pe-page">
+  <div class="pe-topbar">
+    <div class="pe-topbar-inner">
+      <div class="pe-topbar-left">
+        <a class="pe-back" href="/">← 返回控制台</a>
+        <span class="pe-divider" aria-hidden="true"></span>
+        <span class="pe-crumb">人格自我迭代</span>
+      </div>
+      <div class="pe-topbar-right">
+        <button id="refresh" class="pe-btn-ghost" type="button">↻ 刷新</button>
+        <button id="theme-toggle" class="pe-btn-icon" type="button" title="切换明暗主题" aria-label="切换明暗主题">◐</button>
+      </div>
+    </div>
+  </div>
+
+  <main class="pe-shell">
+    <header class="pe-hero">
+      <div class="pe-title">
+        <span class="pe-logo" aria-hidden="true">格</span>
+        <div>
+          <p class="pe-eyebrow">QQ AGENT · PERSONALITY V2</p>
+          <h1>人格自我迭代</h1>
+          <p class="pe-intro">AI 会定期复盘群聊回复并提出表达优化建议，只有经过你审核确认后才会正式生效。</p>
+        </div>
+      </div>
+    </header>
+
+    <p id="error" role="alert" hidden></p>
+    <p id="status" class="status-banner" role="status">正在读取运行状态…</p>
+
+    <nav id="sections" class="pe-tabs" aria-label="人格管理"></nav>
+
+    <section id="overview" class="pe-card">
+      <div class="pe-section-head">
+        <h2>运行总览</h2>
+        <p>整体流程分为三步：收集聊天表现 → 后台 AI 分析 → 人工审核发布。</p>
+      </div>
+      <div id="overview-data"></div>
+      <div id="run-explanation" class="guide"></div>
+      <details class="pe-fold">
+        <summary>队列状态、模型调用与额度明细</summary>
+        <div id="health-summary" class="pe-fold-body"></div>
+      </details>
+      <div class="pe-subhead">
+        <h3>最近后台任务</h3>
+        <p>定时计划（北京时间）：每 30 分钟本地整理一次，每日 03:30 后复盘分析、04:30 后效果评估、每周一 05:00 后趋势总结。聊天忙碌时会自动延后。</p>
+        <p class="meta">下方列表最多展示最近 50 条记录；提示“样本不足”仅表示还在攒数据，并非报错。</p>
+      </div>
+      <div id="jobs" class="record-grid"></div>
+      <details class="pe-fold">
+        <summary>模型请求记录</summary>
+        <div id="calls" class="pe-fold-body"></div>
+      </details>
+      <details class="pe-fold">
+        <summary>近期互动记录（可复制观察 ID 用于手动打分）</summary>
+        <div id="observations" class="record-grid pe-fold-body"></div>
+      </details>
+    </section>
+
+    <section id="reflection" class="pe-card" hidden>
+      <div class="pe-section-head">
+        <h2>AI 复盘报告</h2>
+        <p>每次后台分析都会列出优点、问题与反例，每条结论都关联了真实聊天记录。</p>
+      </div>
+      <div id="reports"></div>
+    </section>
+
+    <section id="cognition" class="pe-card" hidden>
+      <div class="pe-section-head">
+        <h2>长期表达特征</h2>
+        <p>AI 总结出的 Bot 说话习惯画像，仅作参考，不会直接影响聊天回复。</p>
+      </div>
+      <div id="traits"></div>
+    </section>
+
+    <section id="review" class="pe-card" hidden>
+      <div class="pe-section-head">
+        <h2>待审核的 AI 建议</h2>
+      </div>
+      <div class="guide">
+        <p><strong>以下建议尚未生效，由你决定是否采用：</strong></p>
+        <p>1. 查看每条建议的“改进做法”，决定是否符合你的预期。</p>
+        <p>2. 认同且已达标：勾选“采用这条”，再点底部「下一步」；不认同可点“不采用”，拿不准可先跳过。</p>
+        <p>3. 在下一步核对无误后点击「确认采用」，才会正式生成新的人格版本。</p>
+        <p class="meta">提示：“修改措辞”会保存为新草稿；“证据不够”会记录你的意见，等待后续积累更多聊天样本。</p>
+      </div>
+      <div id="preferences"></div>
+      <div class="pe-review-bar">
+        <p id="review-selection" role="status">尚未勾选任何建议。</p>
+        <button id="preview-selected" class="pe-btn-primary" disabled>下一步：核对已选建议</button>
+      </div>
+    </section>
+
+    <section id="snapshot" class="pe-card" hidden>
+      <div class="pe-section-head">
+        <h2>当前生效的表达规则</h2>
+        <p>这里展示正在运行的最新人格版本。Bot 在对应群聊和场景下会自动参考这些规则回复。</p>
+      </div>
+      <div id="current-snapshot"></div>
+    </section>
+
+    <section id="evaluation" class="pe-card" hidden>
+      <div class="pe-section-head">
+        <h2>效果评估与手动反馈</h2>
+        <p>查看新版本上线后的表现变化，也可以针对某次具体回复手动打分。</p>
+      </div>
+      <div id="evaluations"></div>
+      <form id="feedback-form" class="pe-form-card">
+        <h3>针对单条回复打分</h3>
+        <div class="pe-form-grid">
+          <label>观察 ID<input id="feedback-observation" required maxlength="150" placeholder="从「近期互动记录」复制 ID"></label>
+          <label>评估维度
+            <select id="feedback-dimension">
+              <option value="interaction_quality">整体互动质量</option>
+              <option value="conciseness">简洁程度</option>
+              <option value="empathy">共情能力</option>
+              <option value="humor">幽默感</option>
+              <option value="repetition">重复表达</option>
+            </select>
+          </label>
+          <label>表现评价
+            <select id="feedback-score">
+              <option value="0">一般 / 待观察</option>
+              <option value="1">好评（值得保持）</option>
+              <option value="-1">差评（需要改进）</option>
+            </select>
+          </label>
+          <label>备注说明（勿含隐私）<input id="feedback-note" maxlength="500" placeholder="简述这次回复好在哪里或哪里不自然"></label>
+        </div>
+        <div class="pe-form-actions">
+          <button class="pe-btn-primary">提交反馈</button>
+        </div>
+      </form>
+      <div id="feedback"></div>
+    </section>
+
+    <section id="history" class="pe-card" hidden>
+      <div class="pe-section-head">
+        <h2>审核记录与版本历史</h2>
+        <p>随时可回滚到任意历史版本。回滚仅恢复表达规则，不会改动基础人设、记忆或黑话库。</p>
+      </div>
+      <div id="reviews"></div>
+      <div id="versions"></div>
+    </section>
+
+    <section id="module-settings" class="pe-card" hidden>
+      <div class="pe-section-head">
+        <h2>采集与预算设置</h2>
+        <p>管理聊天数据采集开关与 AI 后台分析的每日预算；功能总开关位于主控制台「实验功能」。</p>
+      </div>
+      <div class="pe-init-bar">
+        <p>隐私加密密钥仅在首次启用时初始化一次；显示禁用即表示已就绪，无需重复点击。</p>
+        <button id="initialize" type="button">初始化隐私密钥</button>
+      </div>
+      <form id="settings" class="pe-form-card">
+        <div class="pe-checks">
+          <label class="pe-check"><input type="checkbox" id="capture-enabled"><span>开启群聊表现采集</span></label>
+          <label class="pe-check"><input type="checkbox" id="capture-text"><span>暂存脱敏聊天文本（14 天后自动清除）</span></label>
+          <label class="pe-check"><input type="checkbox" id="analysis-enabled"><span>开启后台 AI 自动复盘分析</span></label>
+          <label class="pe-check"><input type="checkbox" id="unlimited-budget"><span>不设每日费用上限（仍受次数与 Token 限制）</span></label>
+        </div>
+        <div class="pe-form-grid">
+          <label>每日费用上限（单位：百万分之一元，1000000 = 1 元）
+            <input id="money-budget" type="number" min="0" step="1" placeholder="勾选不设上限时留空">
+          </label>
+          <label>结算币种
+            <input id="currency" maxlength="10" placeholder="例如 CNY 或 USD">
+          </label>
+        </div>
+        <p class="meta">后台分析每日最多调用 8 次、最多消耗 128,000 Token，自动复用主模型配置。</p>
+        <div class="pe-form-actions">
+          <button class="pe-btn-primary">保存设置</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="publication-preview" class="pe-card pe-card-accent" hidden>
+      <div class="pe-section-head">
+        <h2>发布前最终确认</h2>
+        <p>确认后将把以下规则保存为最新正式版本并在群聊中生效，不会覆盖原有基础人设。</p>
+      </div>
+      <div id="preview-summary" class="guide"></div>
+      <details class="pe-fold">
+        <summary>查看详细变更对比与校验码</summary>
+        <div class="pe-fold-body">
+          <pre id="preview-diff"></pre>
+          <pre id="preview-hash"></pre>
+        </div>
+      </details>
+      <div class="pe-form-actions">
+        <button id="publish" class="pe-btn-primary">确认发布为新版本</button>
+        <button id="cancel-preview" type="button">返回修改</button>
+      </div>
+    </section>
+
+    <section id="evidence-detail" class="pe-card pe-card-accent" hidden>
+      <div class="pe-section-head">
+        <h2>关联的聊天证据</h2>
+      </div>
+      <div id="evidence-summary"></div>
+      <details class="pe-fold">
+        <summary>查看原始技术详情</summary>
+        <div class="pe-fold-body">
+          <pre id="evidence-data"></pre>
+        </div>
+      </details>
+    </section>
+  </main>
+
+  <script>
+    (function(){
+      const btn = document.getElementById('theme-toggle');
+      if (!btn) return;
+      btn.addEventListener('click', () => {
+        const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+        document.documentElement.dataset.theme = next;
+        try { localStorage.setItem('qqa-theme', next); } catch {}
+      });
+    })();
+  </script>
+  <script src="/personality-learning-page.js"></script>
+</body>
+</html>
