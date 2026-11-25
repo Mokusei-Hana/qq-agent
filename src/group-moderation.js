@@ -106,7 +106,10 @@ export function groupBanTool() {
         || !Number.isInteger(duration) || duration < 0 || duration > MAX_DURATION) {
         return failure('INVALID_ARGUMENTS', '须提供有效目标 QQ 号和 0–2592000 的整数秒数；不允许跨群或传入身份参数');
       }
-      const request = ctx.moderationRequest?.noticeContent === undefined ? ctx.moderationRequest : null;
+      if (ctx.moderationRequest?.noticeContent !== undefined) {
+        return failure('REQUEST_MISMATCH', '当前为群公告请求，禁止在同一轮执行禁言');
+      }
+      const request = ctx.moderationRequest || null;
       const autonomous = !request;
       const requesterId = id(request?.requesterId);
       const ownerId = adminOwnerUin(getConfig());

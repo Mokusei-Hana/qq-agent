@@ -166,7 +166,7 @@ export class PersonalityLearning {
     try {
       const put = db.prepare('INSERT OR IGNORE INTO personality_observations(group_id,response_id,source_key,category,pattern_key,feature_data,created_at) VALUES (?,?,?,?,?,?,?)');
       for (const row of batch) if (this.permitted('group:' + row.group)) put.run(row.group, row.id, row.source, row.features.responseType, row.features.opening, JSON.stringify(row.features), row.at);
-      db.prepare('DELETE FROM personality_observations WHERE id IN (SELECT id FROM personality_observations ORDER BY id DESC LIMIT -1 OFFSET ?)').run(this.cfg.maxObservations);
+      db.prepare('DELETE FROM personality_observations WHERE id <= (SELECT id FROM personality_observations ORDER BY id DESC LIMIT 1 OFFSET ?)').run(this.cfg.maxObservations);
       db.exec('COMMIT');
     } catch (e) { db.exec('ROLLBACK'); throw e; }
   }
@@ -198,31 +198,36 @@ export class PersonalityLearning {
       row.features = JSON.parse(row.feature_data);
       const list = groups.get(row.group_id) || []; list.push(row); groups.set(row.group_id, list);
     }
-    for (const [group, list] of groups) {
-      const repeated = new Set();
-      const counts = new Map();
-      for (const row of list) {
-        if (row.category === 'silence') continue;
-        for (const key of ['opening:' + row.features.opening, 'template:' + row.features.template, ...row.features.grams.map(g => 'gram:' + g)]) counts.set(key, (counts.get(key) || 0) + 1);
+    const upsertHabit = this.db.prepare(`INSERT INTO personality_habits VALUES (?, 'group', ?, 'self_correction', ?, ?, ?, ?, ?, 'candidate', ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET confidence=excluded.confidence,evidence_count=excluded.evidence_count,
+      source_count=excluded.source_count,first_seen_at=excluded.first_seen_at,last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at`);
+    const analyzedAt = this.now();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const [group, list] of groups) {
+        const repeated = new Set();
+        const counts = new Map();
+        for (const row of list) {
+          if (row.category === 'silence') continue;
+          for (const key of ['opening:' + row.features.opening, 'template:' + row.features.template, ...row.features.grams.map(g => 'gram:' + g)]) counts.set(key, (counts.get(key) || 0) + 1);
+        }
+        for (const row of list) if (row.category !== 'silence' && ((counts.get('opening:' + row.features.opening) || 0) >= 3
+          || row.features.grams.some(g => (counts.get('gram:' + g) || 0) >= 5))) repeated.add(row.id);
+        const categories = {
+          filler: list.filter(r => r.features.filler), repetition: list.filter(r => repeated.has(r.id)),
+          empathy: list.filter(r => r.features.scene === 'distress' && r.features.joking),
+          pacing: list.filter(r => r.features.emptyFiller)
+        };
+        for (const [key, evidence] of Object.entries(categories)) {
+          if (evidence.length < 3 || evidence.length / list.length < 0.2) continue;
+          const scene = key === 'empathy' ? 'distress' : '*';
+          const id = 'ph_' + hash([group, key, scene].join(':'));
+          const times = evidence.map(r => r.created_at), sources = new Set(evidence.map(r => r.source_key).filter(Boolean));
+          upsertHabit.run(id, group, key, scene, evidence.length / (evidence.length + 3), evidence.length, sources.size, Math.min(...times), Math.max(...times), analyzedAt);
+        }
       }
-      for (const row of list) if (row.category !== 'silence' && ((counts.get('opening:' + row.features.opening) || 0) >= 3
-        || row.features.grams.some(g => (counts.get('gram:' + g) || 0) >= 5))) repeated.add(row.id);
-      const categories = {
-        filler: list.filter(r => r.features.filler), repetition: list.filter(r => repeated.has(r.id)),
-        empathy: list.filter(r => r.features.scene === 'distress' && r.features.joking),
-        pacing: list.filter(r => r.features.emptyFiller)
-      };
-      for (const [key, evidence] of Object.entries(categories)) {
-        if (evidence.length < 3 || evidence.length / list.length < 0.2) continue;
-        const scene = key === 'empathy' ? 'distress' : '*';
-        const id = 'ph_' + hash([group, key, scene].join(':'));
-        const times = evidence.map(r => r.created_at), sources = new Set(evidence.map(r => r.source_key).filter(Boolean));
-        this.db.prepare(`INSERT INTO personality_habits VALUES (?, 'group', ?, 'self_correction', ?, ?, ?, ?, ?, 'candidate', ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET confidence=excluded.confidence,evidence_count=excluded.evidence_count,
-          source_count=excluded.source_count,first_seen_at=excluded.first_seen_at,last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at`)
-          .run(id, group, key, scene, evidence.length / (evidence.length + 3), evidence.length, sources.size, Math.min(...times), Math.max(...times), this.now());
-      }
-    }
+      this.db.exec('COMMIT');
+    } catch (e) { this.db.exec('ROLLBACK'); throw e; }
     return this.snapshot();
   }
   eligible(row) {
@@ -270,9 +275,16 @@ export class PersonalityLearning {
       if (!row) throw Error('版本不存在');
       const target = JSON.parse(row.content);
       this.db.prepare("UPDATE personality_habits SET status='disabled' WHERE status='active'").run();
+      const activate = this.db.prepare("UPDATE personality_habits SET status='active',updated_at=? WHERE id=?");
+      const restore = this.db.prepare(`INSERT OR IGNORE INTO personality_habits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)`);
+      const now = this.now();
       for (const item of target) {
         if (!knownRule(item.habit_key)) throw Error('版本包含未知偏好');
-        this.db.prepare("UPDATE personality_habits SET status='active',updated_at=? WHERE id=?").run(this.now(), item.id);
+        const info = activate.run(now, item.id);
+        if (!info.changes) {
+          restore.run(item.id, item.scope_type, item.scope_id, item.category, item.habit_key, item.usage_context,
+            item.confidence, item.evidence_count, item.source_count, item.first_seen_at, item.last_seen_at, now);
+        }
       }
     });
   }
@@ -294,7 +306,9 @@ export class PersonalityLearning {
     this.db.prepare('DELETE FROM personality_feedback WHERE created_at<?').run(cutoff);
     const expired = this.db.prepare("SELECT id FROM personality_habits WHERE status IN ('candidate','active') AND last_seen_at<?").all(this.now() - this.cfg.expiryDays * DAY);
     if (expired.length) this.transaction(this.state('version'), 'expiry', '过期长期未观察到的表达偏好', () => {
-      for (const row of expired) this.db.prepare("UPDATE personality_habits SET status='expired',updated_at=? WHERE id=?").run(this.now(), row.id);
+      const expire = this.db.prepare("UPDATE personality_habits SET status='expired',updated_at=? WHERE id=?");
+      const now = this.now();
+      for (const row of expired) expire.run(now, row.id);
     });
     this.reload();
   }

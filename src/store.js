@@ -484,9 +484,6 @@ export class ChatStore {
       if (nextState) transitions.push({ row, nextState, reason });
     }
     if (!transitions.length) return 0;
-    // #region debug-point C:thread-expiry-transition
-    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') for (const { row, nextState, reason } of transitions) (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'C', location: 'src/store.js:expireConversationThreads', msg: '[DEBUG] Conversation thread expired or rolled over', data: { chatKey: row.chat_key, threadId: row.thread_id, previousState: row.state, disposition: row.disposition, nextState, reason, now, idleDeadline: Number(row.idle_deadline) || 0, hardDeadline: Number(row.hard_deadline) || 0, resumeArmedUntil: Number(row.resume_armed_until) || 0 }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
-    // #endregion
     this.#transaction(() => {
       for (const { row, nextState, reason } of transitions) {
         this.db.prepare(`UPDATE conversation_threads SET state=?,close_reason=?,
@@ -616,9 +613,6 @@ export class ChatStore {
       const state = now >= hardDeadline
         ? (activeAtHardDeadline ? 'rollover_armed' : 'closed')
         : normalizedDisposition;
-      // #region debug-point C:lifecycle-deadline-calculation
-      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'C', location: 'src/store.js:updateLifecycleThread', msg: '[DEBUG] Lifecycle deadlines calculated', data: { chatKey, currentThreadId: current?.threadId || null, currentState: current?.state || null, currentDisposition: current?.disposition || null, reusable, acceptedTime, now, normalizedDisposition, idleDeadline, hardDeadline, resumeArmedUntil, activeAtHardDeadline, nextState: state }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
-      // #endregion
       const participants = [...new Set([
         ...(reusable ? current.participantIds : []),
         ...(Array.isArray(participantIds) ? participantIds : [])

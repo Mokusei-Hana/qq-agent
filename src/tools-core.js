@@ -221,9 +221,6 @@ export function buildToolDefs() {
           if (!messages.length) return err('消息内容为空');
           const targetError = messageTargetError(ctx, args);
           if (targetError) return err(targetError);
-          // #region debug-point A-B:send-message-owner
-          if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!String(process.argv[1]).includes('/test/')) (() => { try { const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,B', location: 'src/tools.js:send_message', msg: '[DEBUG] QQ send_message attributed to Agent Session', data: { agentSessionId: ctx.session?.id || null, chatKey: ctx.chatKey, trigger: ctx.session?.trigger || null, triggerSummary: ctx.session?.triggerSummary || '', conversationMode: ctx.session?.conversationMode || null, leaseId: ctx.session?.leaseId || null, messageCount: messages.length, previews: messages.map((text) => String(text).slice(0, 80)) }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
-          // #endregion
           const result = await ctx.sender.sendTextBatch(ctx.chatKey, messages, {
             runId: ctx.session.leaseId, signal: ctx.signal,
             preserveCode: ctx.behaviorProfile === 'grounded',
@@ -265,9 +262,6 @@ export function buildToolDefs() {
           if (targetError) return err(targetError);
           // 内联发送（base64://）不再区分来源：手动表情和已本地化的收藏表情都走这条路径。
           const managedInline = sticker.url.startsWith('base64://');
-          // #region debug-point C-D:sticker-resolution
-          if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!String(process.argv[1]).includes('/test/')) (() => { try { let host = '', pathname = '', queryKeys = []; if (!managedInline) { const parsed = new URL(sticker.url); host = parsed.host; pathname = parsed.pathname; queryKeys = [...parsed.searchParams.keys()]; } const body = JSON.stringify({ sessionId: 'agent-time-sticker-download', runId: 'post-fix', hypothesisId: 'C,D', location: 'src/tools.js:send_sticker', msg: '[DEBUG] Resolved sticker before OneBot delivery', data: { stickerId: sticker.id, source: sticker.source, transport: managedInline ? 'managed-base64' : 'remote-http', host, pathname, queryKeys, urlLength: sticker.url.length, replyToMessageId: args.replyToMessageId ?? null }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
-          // #endregion
           if (!managedInline) {
             try {
               await validateImageUrl(sticker.url); // 只允许公网 http(s)，防止本地库被污染后诱导 OneBot 抓内网

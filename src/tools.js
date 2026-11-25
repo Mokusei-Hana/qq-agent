@@ -28,8 +28,8 @@ export function selectToolDefs(defs, { kind, visionEnabled, searchEnabled,
   const selected = defs.filter((d) => {
     let reason = '';
     if (d.feature === 'slangLearning' && !slangAvailable) reason = 'slang_unavailable';
-    if (d.name === 'slang_review' && !slangReviewAvailable) reason = 'no_owner_approval';
-    if (!visionEnabled && ['get_message_images', 'get_sticker_image'].includes(d.name)) reason = 'vision_disabled';
+    else if (d.name === 'slang_review' && !slangReviewAvailable) reason = 'no_owner_approval';
+    else if (!visionEnabled && ['get_message_images', 'get_sticker_image'].includes(d.name)) reason = 'vision_disabled';
     else if (!searchEnabled && ['web_search', 'web_fetch'].includes(d.name)) reason = 'search_disabled';
     else if (d.feature === 'identityPilot' && !identityAvailable) reason = 'identity_unavailable';
     else if (d.feature === 'friendProposal' && !friendProposalAvailable) reason = 'friend_proposal_unavailable';

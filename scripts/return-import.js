@@ -1,8 +1,8 @@
 // Offline importer. Deliberately has no dependency on config, OneBot, DSH or application boot.
 import fs from 'node:fs';
 import path from 'node:path';
-import { digest, readTerms, writeTerms, SlangLearningStore, chatKey, termKey } from './slang-learning-store.js';
-import { importRecentContext, importBridgeReceipts } from './return-context.js';
+import { digest, readTerms, writeTerms, SlangLearningStore, chatKey, termKey } from '../src/slang-learning-store.js';
+import { importRecentContext, importBridgeReceipts } from '../src/return-context.js';
 
 export function importBridgeBundle({ input, output, identityMap = {} }) {
   input = fs.realpathSync(input); output = path.resolve(output);

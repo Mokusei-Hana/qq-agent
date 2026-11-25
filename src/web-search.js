@@ -305,11 +305,12 @@ function resolveCustomConfig(providerId = null) {
 /**
  * 用户自定义的搜索服务（provider = 'custom' 或 'custom:<id>'）。
  *
- * 两种类型：
+ * 三种类型：
  *   - 'openai'：POST 一个 JSON 搜索接口。为兼容各家实现，会尝试多种常见请求体字段
  *     （query / q / messages）与响应结构（results / data / sources / references / webPages）。
  *     适合 SearXNG、Tavily、自建聚合搜索等。
  *   - 'bing'：GET 一个搜索页并用 b_algo 块解析（兼容 Bing 结果格式的引擎，如部分 SearXNG 实例）。
+ *   - 'exa'：POST Exa Search API（默认 https://api.exa.ai/search，认证头 x-api-key）。
  */
 export function customSearch(query, providerId = null, { signal: parentSignal } = {}) {
   return withTimeWindow((signal) => customSearchRequest(query, providerId, signal), parentSignal);

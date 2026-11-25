@@ -790,9 +790,6 @@ export class Orchestrator {
       const runResult = await this.#runAgent(session, { kind, chatId, chatKey, triggerEntries, proactive, seq,
         manual, contextLimit: tierResult.count, tierInfo: tierResult, conversation, signal: controller.signal });
       controller.signal.throwIfAborted();
-      // #region debug-point A:agent-run-result
-      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'A', location: 'src/orchestrator.js:#wake', msg: '[DEBUG] Agent run completed before lifecycle commit', data: { chatKey, sessionId: session.id, conversationMode: conversation.mode, sentCount: session.sent.length, threadDisposition: session.threadDisposition || null, finishReason: session.finishReason || '', clearHandoff: session.handoffDraft?.clearHandoff === true, triggerCount: triggerEntries.length }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
-      // #endregion
       if (conversation.mode === 'lifecycle') {
         const handoff = this.#commitSessionHandoff(session, { chatKey, triggerEntries });
         this.#commitConversationThread(session, {
@@ -843,9 +840,6 @@ export class Orchestrator {
           details: { rounds: session.rounds, sentCount: session.sent.length }
         });
       }
-      // #region debug-point C-D:agent-run-failed
-      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C,D', location: 'src/orchestrator.js:#wake.catch', msg: '[DEBUG] Agent run failed', data: { sessionId: session.id, threadId: session.threadId || null, error: session.error.slice(0, 500), rounds: session.rounds, calls: session.usage.calls, cumulativeRunTokens: session.usage.totalTokens, promptTokens: session.usage.promptTokens, completionTokens: session.usage.completionTokens, sentCount: session.sent.length, hasEffects: lease ? this.store.hasEffects(lease.id) : false, hasUncertainEffects: lease ? this.store.hasUncertainEffects(lease.id) : false, triggerCount: triggerEntries.length }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
-      // #endregion
       if (lease) {
         if (timeClosed && !this.store.hasEffects(lease.id)) this.store.ackLease(lease.id);
         else this.store.failLease(lease.id, session.error, {
@@ -937,9 +931,6 @@ export class Orchestrator {
   }) {
     const mode = conversation?.mode || 'legacy';
     const currentMode = conversationConfigForChat(chatKey).mode;
-    // #region debug-point D:commit-mode-check
-    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'D', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Conversation mode checked at commit', data: { chatKey, sessionId: session.id, capturedMode: mode, currentMode }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
-    // #endregion
     if (currentMode !== mode) {
       if (mode === 'lifecycle') {
         this.store.commitLifecycleRun({
@@ -972,9 +963,6 @@ export class Orchestrator {
       const persistThread = triggerEntries.length > 0
         || session.sent.length > 0
         || Boolean(session.threadDisposition);
-      // #region debug-point B:lifecycle-commit-decision
-      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'B', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Lifecycle commit decision derived', data: { chatKey, sessionId: session.id, sentCount: session.sent.length, hasOpenWork, explicitDisposition: session.threadDisposition || null, disposition, clearHandoff: session.handoffDraft?.clearHandoff === true, closeReason, persistThread }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
-      // #endregion
       const checkpointState = handoff || session.handoffDraft || {
         summary: session.sent.length
           ? `本轮已发送 ${session.sent.length} 条消息`
@@ -1013,12 +1001,6 @@ export class Orchestrator {
       this.#applyThreadSnapshot(session, result.thread, closeReason ? 'closed' : null);
       if (closeReason) session.threadCloseReason = closeReason;
       session.threadTranscriptChars = result.transcriptChars;
-      // #region debug-point A-C-E:lifecycle-context-committed
-      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,C,E', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Lifecycle context committed', data: { sessionId: session.id, threadId: result.thread?.threadId || null, threadState: result.thread?.state || null, disposition: result.thread?.disposition || null, deltaMessageCount: runResult?.providerTranscriptDelta?.length || 0, deltaChars: JSON.stringify(runResult?.providerTranscriptDelta || []).length, transcriptChars: result.transcriptChars, maxTranscriptChars: Number(conversation?.maxTranscriptChars) || 0, promptTokensLastCall: session.callUsage?.at(-1)?.promptTokens || 0, cumulativeRunTokens: session.usage.totalTokens, forceRollover: runResult?.forceThreadRollover || '' }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
-      // #endregion
-      // #region debug-point E:lifecycle-commit-result
-      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') (() => { const body = JSON.stringify({ sessionId: process.env.DEBUG_SESSION_ID || 'lifecycle-instant-close', runId: process.env.DEBUG_RUN_ID || 'pre-fix', hypothesisId: 'E', location: 'src/orchestrator.js:#commitConversationThread', msg: '[DEBUG] Lifecycle transaction committed', data: { chatKey, sessionId: session.id, acknowledged: result.acknowledged, threadId: result.thread?.threadId || null, threadState: result.thread?.state || null, disposition: result.thread?.disposition || null, idleDeadline: result.thread?.idleDeadline || 0, hardDeadline: result.thread?.hardDeadline || 0, resumeArmedUntil: result.thread?.resumeArmedUntil || 0, transcriptChars: result.transcriptChars }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.DEBUG_SERVER_URL || 'http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.end(body); })();
-      // #endregion
       return;
     }
 
@@ -1159,9 +1141,6 @@ export class Orchestrator {
       )) {
         const previousThreadId = thread.threadId;
         const previousPromptTokens = thread.promptTokens;
-        // #region debug-point C-E:token-rollover
-        if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C,E', location: 'src/orchestrator.js:#runAgent', msg: '[DEBUG] Lifecycle generation rolled before model request', data: { sessionId: session.id, previousThreadId, previousPromptTokens, threshold: Number(conversationCfg.lifecycleRolloverInputTokens) || 32000, storedTranscriptChars: thread.transcriptChars || 0 }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
-        // #endregion
         this.store.armLifecycleRollover?.(
           chatKey,
           'input-token-budget',
@@ -1182,9 +1161,6 @@ export class Orchestrator {
       ? this.store.latestThreadCheckpoint?.(chatKey)
       : null;
     const lifecycleContinuation = priorProviderMessages.length > 0;
-    // #region debug-point A-B-E:lifecycle-context-loaded
-    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const priorChars = JSON.stringify(priorProviderMessages).length; const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,B,E', location: 'src/orchestrator.js:#runAgent', msg: '[DEBUG] Lifecycle context loaded', data: { sessionId: session.id, threadId: thread?.threadId || null, threadState: thread?.state || null, threadOpenedAt: thread?.openedAt || 0, threadAgeMs: thread?.openedAt ? Date.now() - thread.openedAt : 0, storedTranscriptChars: thread?.transcriptChars || 0, priorMessageCount: priorProviderMessages.length, priorChars, lifecycleContinuation, contextLimit, maxTranscriptChars: Number(conversationCfg.maxTranscriptChars) || 0, hardLifetimeMs: Number(conversationCfg.hardLifetimeMs) || 0 }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
-    // #endregion
 
     // 首轮带完整上下文；生命周期后续轮只附加增量，旧消息保持字节级稳定以命中 DeepSeek 前缀缓存。
     const userPrompt = buildUserPrompt({
@@ -1319,13 +1295,7 @@ export class Orchestrator {
         auditMessages: requestAuditMessages
       } = estimate;
       const outputReserveTokens = 2048;
-      // #region debug-point A-C-D:request-budget-check
-      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const stats = {}; for (const message of messages) { const role = String(message?.role || 'unknown'); const row = stats[role] ||= { count: 0, jsonChars: 0, contentChars: 0, reasoningChars: 0, toolArgChars: 0 }; row.count += 1; row.jsonChars += JSON.stringify(message).length; row.contentChars += typeof message?.content === 'string' ? message.content.length : JSON.stringify(message?.content ?? '').length; row.reasoningChars += String(message?.reasoning_content || '').length; row.toolArgChars += (message?.tool_calls || []).reduce((sum, call) => sum + String(call?.function?.arguments || '').length, 0); } const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,C,D', location: 'src/orchestrator.js:#runAgent.round', msg: '[DEBUG] Request budget evaluated', data: { sessionId: session.id, threadId: thread?.threadId || null, round: round + 1, maxRounds, messageCount: messages.length, messageChars: JSON.stringify(messages).length, toolSchemaChars: JSON.stringify(openAiTools).length, cumulativeRunTokens: Number(session.usage.totalTokens) || 0, maxRunTokens, estimatedPromptTokens, outputReserveTokens, projectedRunTokens: Number(session.usage.totalTokens) + estimatedPromptTokens + outputReserveTokens, roles: stats }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
-      // #endregion
       if (session.usage.totalTokens + estimatedPromptTokens + outputReserveTokens > maxRunTokens) {
-        // #region debug-point C:run-budget-rejected
-        if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C', location: 'src/orchestrator.js:#runAgent.round', msg: '[DEBUG] Run stopped before exceeding token budget', data: { sessionId: session.id, threadId: thread?.threadId || null, nextRound: round + 1, cumulativeRunTokens: Number(session.usage.totalTokens) || 0, estimatedPromptTokens, outputReserveTokens, projectedRunTokens: Number(session.usage.totalTokens) + estimatedPromptTokens + outputReserveTokens, maxRunTokens, sentCount: session.sent.length }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
-        // #endregion
         session.budgetStopped = true;
         session.budgetStopReason = 'next-call-budget';
         session.estimatedNextPromptTokens = estimatedPromptTokens;
@@ -1369,9 +1339,6 @@ export class Orchestrator {
         completionTokens: Number(response.usage?.completion_tokens) || 0,
         totalTokens: Number(response.usage?.total_tokens) || 0
       });
-      // #region debug-point C-D:provider-usage-returned
-      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'C,D', location: 'src/orchestrator.js:#runAgent.response', msg: '[DEBUG] Provider usage returned', data: { sessionId: session.id, threadId: thread?.threadId || null, round: round + 1, promptTokens, completionTokens: Number(response.usage?.completion_tokens) || 0, totalTokens: Number(response.usage?.total_tokens) || 0, cachedTokens: Math.min(promptTokens, cachedTokens), cumulativeRunTokens: Number(session.usage.totalTokens) || 0, finishReason: response.finishReason || null, assistantContentChars: typeof response.message?.content === 'string' ? response.message.content.length : 0, reasoningChars: String(response.message?.reasoning_content || '').length, toolNames: (response.message?.tool_calls || []).map((call) => call?.function?.name || '') }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
-      // #endregion
 
       const msg = response.message;
       const finalContent = typeof msg.content === 'string' ? msg.content : (msg.content ?? null);
@@ -1526,9 +1493,6 @@ export class Orchestrator {
       ...(terminalReasoning ? { reasoning_content: terminalReasoning } : {})
     });
     const containsInlineImage = hasInlineImage(providerTranscriptDelta);
-    // #region debug-point A-D:lifecycle-delta-ready
-    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (chatKey === 'group:1044877051' && !process.env.NODE_TEST_CONTEXT) (() => { try { const body = JSON.stringify({ sessionId: 'group-context-overflow', runId: process.env.QQ_CONTEXT_DEBUG_RUN || 'post-fix', hypothesisId: 'A,D', location: 'src/orchestrator.js:#runAgent.return', msg: '[DEBUG] Lifecycle transcript delta ready', data: { sessionId: session.id, threadId: thread?.threadId || null, messageCount: providerTranscriptDelta.length, deltaChars: JSON.stringify(providerTranscriptDelta).length, containsInlineImage, sentCount: session.sent.length, rounds: session.rounds }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request(process.env.QQ_CONTEXT_DEBUG_URL || 'http://192.168.31.10:7781/event', { method: 'POST', signal: AbortSignal.timeout(500), headers: { 'content-type': 'application/json' } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.end(body); } catch {} })();
-    // #endregion
     return {
       providerTranscriptDelta: containsInlineImage ? [] : providerTranscriptDelta,
       forceThreadRollover: containsInlineImage ? 'multimodal-context' : ''
@@ -1563,9 +1527,6 @@ export class Orchestrator {
 
   startProactiveLoop() {
     this.stopProactiveLoop();
-    // #region debug-point A-C:proactive-loop-restart
-    if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!String(process.argv[1]).includes('/test/')) (() => { try { const cfg = getConfig(); const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,C', location: 'src/orchestrator.js:startProactiveLoop', msg: '[DEBUG] Proactive loop restarted', data: { enabled: cfg.proactive?.enabled === true, initialDelayMs: 15000, checkIntervalMinMs: cfg.proactive?.checkIntervalMinMs, checkIntervalMaxMs: cfg.proactive?.checkIntervalMaxMs, probability: cfg.proactive?.probability, suppressions: [...this.proactiveSuppressions] }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
-    // #endregion
     const tick = async () => {
       const cfg = getConfig();
       const next = randInt(
@@ -1575,9 +1536,6 @@ export class Orchestrator {
       this.proactiveTimer = setTimeout(() => { tick().catch(() => {}); }, next);
       if (this.aborted || this.paused || cfg.proactive?.enabled !== true) return;
       if (this.proactiveSuppressions.size > 0) {
-        // #region debug-point A-C:proactive-tick-suppressed
-        if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!String(process.argv[1]).includes('/test/')) (() => { try { const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,C', location: 'src/orchestrator.js:startProactiveLoop.tick', msg: '[DEBUG] Proactive tick suppressed by background task', data: { suppressions: [...this.proactiveSuppressions], nextDelayMs: next }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
-        // #endregion
         return;
       }
       if (this.runningChats.size >= Math.max(1, Number(cfg.maxConcurrentRuns) || 2)) return;
@@ -1586,9 +1544,6 @@ export class Orchestrator {
       const candidates = this.#proactiveCandidates(cfg);
       if (!candidates.length) return;
       const chatKey = candidates[Math.floor(Math.random() * candidates.length)];
-      // #region debug-point A-C:proactive-chat-selected
-      if (process.env.QQ_AGENT_DEBUG_TELEMETRY === '1') if (!String(process.argv[1]).includes('/test/')) (() => { try { const body = JSON.stringify({ sessionId: 'daily-summary-group-send', runId: 'post-fix', hypothesisId: 'A,C', location: 'src/orchestrator.js:startProactiveLoop.tick', msg: '[DEBUG] Proactive loop selected a chat', data: { chatKey, candidateCount: candidates.length, runningChats: this.runningChats.size }, ts: Date.now() }); const req = process.getBuiltinModule('node:http').request('http://192.168.31.10:7777/event', { method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, (res) => res.resume()); req.on('error', () => {}); req.on('socket', (socket) => socket.unref()); req.setTimeout(500, () => req.destroy()); req.end(body); } catch {} })();
-      // #endregion
       this.wake(chatKey, { proactive: true }).catch((error) => console.error('[orchestrator] proactive 出错:', error));
     };
     this.proactiveTimer = setTimeout(() => { tick().catch(() => {}); }, 15000);

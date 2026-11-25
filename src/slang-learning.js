@@ -62,8 +62,16 @@ export class SlangLearning {
     this.store = new SlangLearningStore(dataDir);
     this.windows = new Map(); this.cooldowns = new Map(); this.tasks = new Map();
     this.active = false; this.controller = null; this.running = null; this.timer = null;
+    this._cachedRawSettings = undefined; this._cachedSettings = null;
   }
-  settings() { return slangLearningSettings(this.config()?.slangLearning); }
+  settings() {
+    const raw = this.config()?.slangLearning;
+    if (raw === this._cachedRawSettings && this._cachedSettings) return this._cachedSettings;
+    const parsed = slangLearningSettings(raw);
+    this._cachedRawSettings = raw;
+    this._cachedSettings = parsed;
+    return parsed;
+  }
   permitted(chat) {
     const cfg = this.settings();
     return cfg.enabled && /^group:[1-9]\d*$/.test(chat) && cfg.groups.includes(chat.slice(6)) && this.allowed(chat);
