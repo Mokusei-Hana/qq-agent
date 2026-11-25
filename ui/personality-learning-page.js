@@ -1,7 +1,7 @@
 'use strict';
 (function(){
  const $=id=>document.getElementById(id),selected=new Map();
- let state=null,current=[],preview=null,csrfToken='';
+ let state=null,current=[],allPreferences=[],preview=null,csrfToken='';
  const tabs=[
   ['overview','运行总览'],
   ['review','AI 建议'],
@@ -271,6 +271,47 @@
   $('preview-selected').disabled=selected.size===0;
  }
 
+ function preferenceBucket(row){
+  if(current.some(e=>e.id===row.preference_id&&e.revision===row.revision))return 'active';
+  if(row.review_action)return 'reviewed';
+  return row.publicationReadiness?.ready?'ready':'pending';
+ }
+
+ function renderPreferences(){
+  const q=($('pref-search')?.value||'').trim().toLocaleLowerCase();
+  const statusFilter=$('pref-status-filter')?.value||'';
+  const dimFilter=$('pref-dimension-filter')?.value||'';
+  const filtered=allPreferences.filter(row=>{
+   if(statusFilter&&preferenceBucket(row)!==statusFilter)return false;
+   const dim=parsed(row.rule_json,{}).dimension||row.dimension||'';
+   if(dimFilter&&dim!==dimFilter)return false;
+   if(q){
+    const hay=[row.name,row.rule_text,row.rationale,tr(dim)].join(' ').toLocaleLowerCase();
+    if(!hay.includes(q))return false;
+   }
+   return true;
+  });
+  if($('pref-count'))$('pref-count').textContent=(q||statusFilter||dimFilter)?'显示 '+filtered.length+' / '+allPreferences.length+' 条':'共 '+allPreferences.length+' 条';
+  records('preferences',filtered,(card,row)=>{
+   const inUse=current.some(e=>e.id===row.preference_id&&e.revision===row.revision),eligible=row.publicationReadiness?.ready===true;
+   if(!inUse){
+    const label=node('label',eligible?'采用这条建议':'暂未达标，还不能采用'),box=node('input');
+    box.type='checkbox';box.disabled=!eligible;
+    const picked=selected.get(row.preference_id);
+    box.checked=!!(picked&&picked.revision===row.revision);
+    box.onchange=()=>{if(box.checked)selected.set(row.preference_id,{id:row.preference_id,revision:row.revision,contentHash:row.content_hash});else selected.delete(row.preference_id);updateSelection();};
+    label.prepend(box);card.append(label);
+    card.append(
+     button('修改措辞',()=>decision(row,'edit')),
+     button('不采用',()=>decision(row,'reject')),
+     button('先观望',()=>decision(row,'request_evidence'))
+    );
+   }else{
+    card.append(button('停用规则',()=>makePreview({operation:'remove',selections:current.filter(e=>e.id!==row.preference_id),reason:'停用规则'})));
+   }
+  });
+ }
+
  async function refresh(){
   preview=null;selected.clear();updateSelection();$('publication-preview').hidden=true;
   state=await request('status');
@@ -278,27 +319,13 @@
   const results=await Promise.all(kinds.map(k=>request(k)));
   const data=Object.fromEntries(kinds.map((k,i)=>[k,results[i].data]));
   const active=data.versions.find(v=>v.id===state.version);current=active?parsed(active.content,[]):[];
+  allPreferences=data.preferences||[];
   renderOverview(data);
   for(let i=0;i<kinds.length;i++){
    const kind=kinds[i],rows=results[i].data;
+   if(kind==='preferences'){renderPreferences();continue;}
    if(kind==='versions'){const active=rows.find(v=>v.id===state.version);current=active?JSON.parse(active.content):[];records('current-snapshot',current);}
    records(kind,rows,(card,row)=>{
-    if(kind==='preferences'){
-     const inUse=current.some(e=>e.id===row.preference_id&&e.revision===row.revision),eligible=row.publicationReadiness?.ready===true;
-     if(!inUse){
-      const label=node('label',eligible?'采用这条建议':'暂未达标，还不能采用'),box=node('input');
-      box.type='checkbox';box.disabled=!eligible;
-      box.onchange=()=>{if(box.checked)selected.set(row.preference_id,{id:row.preference_id,revision:row.revision,contentHash:row.content_hash});else selected.delete(row.preference_id);updateSelection();};
-      label.prepend(box);card.append(label);
-      card.append(
-       button('修改措辞',()=>decision(row,'edit')),
-       button('不采用',()=>decision(row,'reject')),
-       button('先观望',()=>decision(row,'request_evidence'))
-      );
-     }else{
-      card.append(button('停用规则',()=>makePreview({operation:'remove',selections:current.filter(e=>e.id!==row.preference_id),reason:'停用规则'})));
-     }
-    }
     if(kind==='versions'&&row.id!==state.version)card.append(button('回滚到此版本',()=>makePreview({operation:'rollback',rollbackTarget:row.id,reason:'回滚到历史版本'})));
     if(kind==='observations')card.append(button('查看详情',()=>showEvidence(row.id)));
    });
@@ -322,6 +349,9 @@
   $('sections').append(b);
  }
  $('refresh').onclick=()=>guard(refresh);
+ $('pref-search').oninput=renderPreferences;
+ $('pref-status-filter').onchange=renderPreferences;
+ $('pref-dimension-filter').onchange=renderPreferences;
  $('preview-selected').onclick=()=>guard(async()=>{
   const combined=new Map(current.map(e=>[e.id,e]));for(const [id,entry] of selected)combined.set(id,entry);
   if(!selected.size)throw Error('请先勾选至少 1 条已达标的建议。');

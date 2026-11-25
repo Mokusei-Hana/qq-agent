@@ -94,6 +94,28 @@
         <p>3. 在下一步核对无误后点击「确认采用」，才会正式生成新的人格版本。</p>
         <p class="meta">提示：“修改措辞”会保存为新草稿；“证据不够”会记录你的意见，等待后续积累更多聊天样本。</p>
       </div>
+      <div class="pe-filter-bar">
+        <input id="pref-search" type="search" placeholder="搜索建议名称、做法或理由…" autocomplete="off">
+        <select id="pref-status-filter" aria-label="按状态筛选">
+          <option value="">全部状态</option>
+          <option value="ready">已达标（可采用）</option>
+          <option value="active">使用中</option>
+          <option value="pending">证据积累中</option>
+          <option value="reviewed">已处理（不采用 / 观望 / 已修改）</option>
+        </select>
+        <select id="pref-dimension-filter" aria-label="按维度筛选">
+          <option value="">全部维度</option>
+          <option value="conciseness">简洁程度</option>
+          <option value="initiative">主动性</option>
+          <option value="humor">幽默感</option>
+          <option value="empathy">共情能力</option>
+          <option value="repetition">避免重复</option>
+          <option value="mechanical_expression">减少机械感</option>
+          <option value="scene_adaptation">场景贴合度</option>
+          <option value="interaction_quality">整体互动质量</option>
+        </select>
+        <span id="pref-count" class="pe-count">共 0 条</span>
+      </div>
       <div id="preferences"></div>
       <div class="pe-review-bar">
         <p id="review-selection" role="status">尚未勾选任何建议。</p>
